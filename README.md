@@ -1,4 +1,4 @@
-# A ZERO Player v0.71
+# A ZERO Player v0.71 for SF2000 retro console (Data Frog)
 
 Motion JPEG video player for SF2000 (Data Frog) handheld console.
 

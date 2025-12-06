@@ -1,16 +1,19 @@
-# A ZERO Player v0.71 for SF2000 retro console (Data Frog)
+# A ZERO Player v0.75
 
 Motion JPEG video player for SF2000 (Data Frog) handheld console.
 
 ## Features
 
 - **Motion JPEG (MJPEG) AVI playback** - software decoding
+- **Built-in file browser** - load videos directly from SD card
 - **15 color modes** - Normal, Night, Warm, Sepia, Grayscale, Dither variations and more
 - **Seek controls** - Left/Right (15s), Up/Down (1min), slider in menu
 - **Time display** with black outline for visibility
 - **Amiga-style menu** - press START to access
-- **Key lock** - hold SELECT to lock controls
+- **Save Settings** - remembers color mode, display options, last directory
+- **Key lock** - hold L+R shoulders for 2 seconds to lock/unlock controls
 - **Debug panel** - FPS, frame count, audio buffer status
+- **Polish character support** - filenames with Polish letters display correctly
 
 ## Controls
 
@@ -18,18 +21,21 @@ Motion JPEG video player for SF2000 (Data Frog) handheld console.
 |--------|--------|
 | START | Open/close menu |
 | A | Play/pause (or select in menu) |
-| B | Back (close submenu) |
+| B | Back (close submenu / go up in file browser) |
 | Left/Right | Skip 15 seconds |
 | Up/Down | Skip 1 minute |
 | L/R Shoulders | Cycle menu options |
-| SELECT (hold) | Toggle key lock |
+| L+R (hold 2s) | Toggle key lock |
 
 ## Installation
 
 1. Copy `core_87000000` to your SD card: `/cores/a0_player/core_87000000`
-2. Create a launcher file in ROMS folder, e.g.: `ROMS/a0_player;myvideo.gba`
-3. Place your MJPEG AVI video as `myvideo.avi` in `ROMS/a0_player/myvideo.gba`
-4. Launch the console and go to ROMS menu and find your file.
+2. Videos go to `/VIDEOS/` folder on SD card (created automatically)
+3. Create a launcher file: `ROMS/a0_player;start.gba` (any name works)
+4. Launch the console, go to ROMS menu and find your launcher
+5. Use the built-in file browser to select videos from `/VIDEOS/`
+
+**Alternative**: You can also launch videos directly by naming them `a0_player;videoname.gba` in ROMS folder.
 
 ## Supported Video Format
 
@@ -37,7 +43,7 @@ Motion JPEG video player for SF2000 (Data Frog) handheld console.
 - **Video codec**: Motion JPEG (MJPEG)
 - **Resolution**: Up to 320x240 (larger videos are scaled down)
 - **Frame rate**: Any (displayed at native rate with frame repeat if needed)
-- **Audio**: Currently visual only (audio support in progress)
+- **Audio**: PCM audio supported (22050Hz mono recommended)
 
 ### Recommended Settings
 
@@ -61,7 +67,20 @@ ffmpeg -i input.mp4 -vf "scale=320:240:force_original_aspect_ratio=decrease,pad=
 
 # 30 fps (may have slowdowns)
 ffmpeg -i input.mp4 -vf "scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v mjpeg -q:v 5 output.avi
+
+# With audio (15 fps)
+ffmpeg -i input.mp4 -vf "scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2,fps=15" -c:v mjpeg -q:v 5 -c:a pcm_s16le -ar 22050 -ac 1 output.avi
 ```
+
+## Settings
+
+Settings are saved to `/VIDEOS/a0player.cfg` when you select "Save Settings" in menu:
+- Color mode
+- Show Time on/off
+- Debug Info on/off
+- Last browsed directory
+
+Settings are loaded automatically on startup.
 
 ## Building from Source
 
@@ -80,6 +99,23 @@ Then link with sf2000_multicore to create `core_87000000`.
 - **JPEG decoder**: TJpgDec (Tiny JPEG Decompressor)
 - **Architecture**: MIPS32 soft-float (no FPU)
 - **Memory**: Static allocation, no malloc at runtime
+
+## Changelog
+
+### v0.75
+- Built-in file browser for loading videos from SD card
+- VIDEOS folder auto-created on first run
+- Save/Load settings (color mode, time/debug display, last directory)
+- Improved A/V synchronization
+- Polish character support in filenames
+- Color mode submenu wraps around
+- Save feedback popup
+
+### v0.71
+- Initial public release
+- 15 color modes
+- Seek controls and time display
+- Key lock feature
 
 ## License
 

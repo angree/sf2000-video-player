@@ -1,5 +1,5 @@
 /*
- * PMP071 - A ZERO Player
+ * PMP072 - A ZERO Player
  * - FAST video player with idx1 index support
  * - Auto-detect offset format
  * - Supports 3+ hour videos at 30fps (360000 frames)
@@ -10,16 +10,42 @@
  * - Scrollable color mode submenu
  * - Dither2/Night+Dither2 modes (dither black for smooth transitions)
  * - Enhanced warm tint (more visible red shift)
+ * - Built-in file browser (load videos from SD card)
  * by Grzegorz Korycki
  */
 
 #include "libretro.h"
 #include "tjpgd.h"
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <math.h>
+
+/* SF2000 filesystem functions - DO NOT use standard fopen/fread! */
+#define FS_O_RDONLY     0x0000
+#define FS_O_WRONLY     0x0001
+#define FS_O_RDWR       0x0002
+#define FS_O_CREAT      0x0100
+#define FS_O_TRUNC      0x0200
+
+extern int fs_open(const char *path, int oflag, int perms);
+extern int fs_close(int fd);
+extern int64_t fs_lseek(int fd, int64_t offset, int whence);
+extern ssize_t fs_read(int fd, void *buf, size_t nbyte);
+extern ssize_t fs_write(int fd, const void *buf, size_t nbyte);
+extern int fs_mkdir(const char *path, int mode);
+extern int fs_opendir(const char *path);
+extern int fs_closedir(int fd);
+extern ssize_t fs_readdir(int fd, void *buffer);
+
+/* S_ISREG and S_ISDIR macros for fs_readdir type field */
+#define S_IFMT   0170000
+#define S_IFREG  0100000
+#define S_IFDIR  0040000
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 
 #define SCREEN_WIDTH  320
 #define SCREEN_HEIGHT 240
@@ -155,7 +181,7 @@ static uint8_t gamma_g6[COLOR_MODE_COUNT][64];
 static uint8_t gamma_b5[COLOR_MODE_COUNT][32];  /* separate B for warm modes */
 
 /* Menu overlay */
-#define MENU_ITEMS 8
+#define MENU_ITEMS 10
 static int menu_active = 0;
 static int menu_selection = 0;
 static int prev_start = 0;
@@ -165,17 +191,40 @@ static int show_time = 1;     /* time display visible (ON by default) */
 static int show_debug = 0;    /* debug panel visible (OFF by default) */
 static int seek_position = 0;  /* 0-20 (0%, 5%, 10%, ... 100%) */
 static int was_paused_before_menu = 0;  /* remember pause state */
-static int submenu_active = 0;  /* 0=none, 1=instructions, 2=greetings */
+static int submenu_active = 0;  /* 0=none, 1=instructions, 2=greetings, 3=file browser */
+static int save_feedback_timer = 0;  /* frames to show "Settings Saved" message */
+#define SAVE_FEEDBACK_FRAMES 60  /* 2 seconds at 30fps */
 static const char *menu_labels[MENU_ITEMS] = {
-    "Go to Position",
-    "Color Mode",
-    "Resume",
-    "Show Time",
-    "Debug Info",
-    "Restart",
-    "Instructions",
-    "About"
+    "Load File",       /* 0 */
+    "Go to Position",  /* 1 */
+    "Color Mode",      /* 2 */
+    "Resume",          /* 3 */
+    "Show Time",       /* 4 */
+    "Debug Info",      /* 5 */
+    "Restart",         /* 6 */
+    "Save Settings",   /* 7 - NEW */
+    "Instructions",    /* 8 */
+    "About"            /* 9 */
 };
+
+/* File browser */
+#define FB_MAX_FILES 64
+#define FB_MAX_PATH 256
+#define FB_MAX_NAME 64
+#define FB_VISIBLE_ITEMS 15
+#define FB_START_PATH "/mnt/sda1/VIDEOS"
+#define SETTINGS_FILE "/mnt/sda1/VIDEOS/a0player.cfg"
+
+static int file_browser_active = 0;
+static char fb_current_path[FB_MAX_PATH] = FB_START_PATH;
+static char system_directory[FB_MAX_PATH] = "";
+static char fb_files[FB_MAX_FILES][FB_MAX_NAME];
+static int fb_is_dir[FB_MAX_FILES];  /* 1 = directory, 0 = file */
+static int fb_file_count = 0;
+static int fb_selection = 0;
+static int fb_scroll = 0;
+static int no_file_loaded = 0;  /* 1 if started without file */
+static char loaded_file_path[FB_MAX_PATH] = "";
 
 /* Visual feedback icons */
 #define ICON_NONE 0
@@ -439,6 +488,24 @@ static void draw_fill_rect(int x1, int y1, int x2, int y2, pixel_t col) {
     }
 }
 
+/* Draw rectangle outline (border only) */
+static void draw_rect(int x1, int y1, int x2, int y2, pixel_t col) {
+    /* Top and bottom edges */
+    for (int x = x1; x <= x2 && x < SCREEN_WIDTH; x++) {
+        if (x >= 0) {
+            if (y1 >= 0 && y1 < SCREEN_HEIGHT) framebuffer[y1 * SCREEN_WIDTH + x] = col;
+            if (y2 >= 0 && y2 < SCREEN_HEIGHT) framebuffer[y2 * SCREEN_WIDTH + x] = col;
+        }
+    }
+    /* Left and right edges */
+    for (int y = y1; y <= y2 && y < SCREEN_HEIGHT; y++) {
+        if (y >= 0) {
+            if (x1 >= 0 && x1 < SCREEN_WIDTH) framebuffer[y * SCREEN_WIDTH + x1] = col;
+            if (x2 >= 0 && x2 < SCREEN_WIDTH) framebuffer[y * SCREEN_WIDTH + x2] = col;
+        }
+    }
+}
+
 /* Draw circle outline */
 static void draw_circle(int cx, int cy, int r, pixel_t col) {
     for (int angle = 0; angle < 360; angle += 5) {
@@ -627,13 +694,359 @@ static void draw_icon(int type) {
 
 /* Forward declaration for seek preview */
 static int decode_single_frame(int idx);
+static int load_avi_file(const char *path);
+
+/* ========== Settings save/load ========== */
+static void save_settings(void) {
+    /* Ensure VIDEOS directory exists first */
+    int fd = fs_open(FB_START_PATH, FS_O_RDONLY, 0);
+    if (fd >= 0) {
+        fs_close(fd);
+    } else {
+        fs_mkdir(FB_START_PATH, 0777);
+    }
+
+    /* Write settings to temp file first (atomic write) */
+    char tmp_path[FB_MAX_PATH];
+    snprintf(tmp_path, FB_MAX_PATH, "%s.tmp", SETTINGS_FILE);
+
+    fd = fs_open(tmp_path, FS_O_WRONLY | FS_O_CREAT | FS_O_TRUNC, 0666);
+    if (fd < 0) return;  /* Can't write - SD might be read-only */
+
+    /* Simple key=value format */
+    char buf[512];
+    int len = snprintf(buf, 512,
+        "# A ZERO Player settings\n"
+        "color_mode=%d\n"
+        "show_time=%d\n"
+        "show_debug=%d\n"
+        "last_dir=%s\n",
+        color_mode, show_time, show_debug, fb_current_path);
+
+    fs_write(fd, buf, len);
+    fs_close(fd);
+
+    /* TODO: rename tmp to final (atomic) - for now just write directly */
+    /* Since rename might not work reliably, write directly to final */
+    fd = fs_open(SETTINGS_FILE, FS_O_WRONLY | FS_O_CREAT | FS_O_TRUNC, 0666);
+    if (fd >= 0) {
+        fs_write(fd, buf, len);
+        fs_close(fd);
+    }
+}
+
+static void load_settings(void) {
+    int fd = fs_open(SETTINGS_FILE, FS_O_RDONLY, 0);
+    if (fd < 0) return;  /* No settings file - use defaults */
+
+    char buf[512];
+    ssize_t bytes = fs_read(fd, buf, 511);
+    fs_close(fd);
+
+    if (bytes <= 0) return;
+    buf[bytes] = '\0';
+
+    /* Parse key=value lines */
+    char *line = buf;
+    while (line && *line) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = '\0';
+
+        /* Skip comments and empty lines */
+        if (line[0] == '#' || line[0] == '\0') {
+            line = next;
+            continue;
+        }
+
+        char *eq = strchr(line, '=');
+        if (eq) {
+            *eq = '\0';
+            char *key = line;
+            char *val = eq + 1;
+
+            if (strcmp(key, "color_mode") == 0) {
+                int v = 0;
+                while (*val >= '0' && *val <= '9') v = v * 10 + (*val++ - '0');
+                if (v >= 0 && v < COLOR_MODE_COUNT) color_mode = v;
+            }
+            else if (strcmp(key, "show_time") == 0) {
+                show_time = (val[0] == '1') ? 1 : 0;
+            }
+            else if (strcmp(key, "show_debug") == 0) {
+                show_debug = (val[0] == '1') ? 1 : 0;
+            }
+            else if (strcmp(key, "last_dir") == 0) {
+                strncpy(fb_current_path, val, FB_MAX_PATH - 1);
+                fb_current_path[FB_MAX_PATH - 1] = '\0';
+            }
+        }
+        line = next;
+    }
+}
+
+/* File browser functions */
+static void fb_ensure_videos_dir(void) {
+    /* Try to create VIDEOS directory if it doesn't exist */
+    int fd = fs_open(FB_START_PATH, FS_O_RDONLY, 0);
+    if (fd >= 0) {
+        fs_close(fd);
+    } else {
+        fs_mkdir(FB_START_PATH, 0777);
+    }
+}
+
+static int str_ends_with(const char *str, const char *suffix) {
+    int str_len = strlen(str);
+    int suffix_len = strlen(suffix);
+    if (suffix_len > str_len) return 0;
+    return strcasecmp(str + str_len - suffix_len, suffix) == 0;
+}
+
+/* Convert Polish UTF-8 characters to Latin equivalents for display */
+static void polish_to_latin(const char *src, char *dst, int max_len) {
+    int i = 0, j = 0;
+    while (src[i] && j < max_len - 1) {
+        unsigned char c = (unsigned char)src[i];
+        /* UTF-8 Polish characters (2-byte sequences starting with 0xC4 or 0xC5) */
+        if (c == 0xC4 && src[i+1]) {
+            unsigned char c2 = (unsigned char)src[i+1];
+            switch (c2) {
+                case 0x84: dst[j++] = 'A'; break;  /* Ą */
+                case 0x85: dst[j++] = 'a'; break;  /* ą */
+                case 0x86: dst[j++] = 'C'; break;  /* Ć */
+                case 0x87: dst[j++] = 'c'; break;  /* ć */
+                case 0x98: dst[j++] = 'E'; break;  /* Ę */
+                case 0x99: dst[j++] = 'e'; break;  /* ę */
+                default: dst[j++] = '?'; break;
+            }
+            i += 2;
+        } else if (c == 0xC5 && src[i+1]) {
+            unsigned char c2 = (unsigned char)src[i+1];
+            switch (c2) {
+                case 0x81: dst[j++] = 'L'; break;  /* Ł */
+                case 0x82: dst[j++] = 'l'; break;  /* ł */
+                case 0x83: dst[j++] = 'N'; break;  /* Ń */
+                case 0x84: dst[j++] = 'n'; break;  /* ń */
+                case 0x9A: dst[j++] = 'S'; break;  /* Ś */
+                case 0x9B: dst[j++] = 's'; break;  /* ś */
+                case 0xB9: dst[j++] = 'Z'; break;  /* Ź */
+                case 0xBA: dst[j++] = 'z'; break;  /* ź */
+                case 0xBB: dst[j++] = 'Z'; break;  /* Ż */
+                case 0xBC: dst[j++] = 'z'; break;  /* ż */
+                case 0xB3: dst[j++] = 'O'; break;  /* Ó */
+                case 0xB4: dst[j++] = 'o'; break;  /* ó - note: Ó is actually 0xC3 0x93 */
+                default: dst[j++] = '?'; break;
+            }
+            i += 2;
+        } else if (c == 0xC3 && src[i+1]) {
+            /* Ó/ó are in Latin-1 supplement range */
+            unsigned char c2 = (unsigned char)src[i+1];
+            switch (c2) {
+                case 0x93: dst[j++] = 'O'; break;  /* Ó */
+                case 0xB3: dst[j++] = 'o'; break;  /* ó */
+                default: dst[j++] = '?'; break;
+            }
+            i += 2;
+        } else if (c >= 0x80) {
+            /* Other multi-byte UTF-8 - skip */
+            if ((c & 0xE0) == 0xC0) i += 2;
+            else if ((c & 0xF0) == 0xE0) i += 3;
+            else if ((c & 0xF8) == 0xF0) i += 4;
+            else i++;
+            dst[j++] = '?';
+        } else {
+            dst[j++] = src[i++];
+        }
+    }
+    dst[j] = '\0';
+}
+
+static void fb_scan_directory(void) {
+    /* fs_readdir buffer structure */
+    union {
+        struct {
+            uint8_t _1[0x10];
+            uint32_t type;
+        };
+        struct {
+            uint8_t _2[0x22];
+            char d_name[0x225];
+        };
+        uint8_t __[0x428];
+    } buffer;
+
+    fb_file_count = 0;
+    fb_selection = 0;
+    fb_scroll = 0;
+
+    int dir_fd = fs_opendir(fb_current_path);
+    if (dir_fd < 0) {
+        /* Directory doesn't exist, try to go to root */
+        strcpy(fb_current_path, "/mnt/sda1");
+        dir_fd = fs_opendir(fb_current_path);
+        if (dir_fd < 0) return;
+    }
+
+    /* First add ".." entry if not at root */
+    if (strcmp(fb_current_path, "/mnt/sda1") != 0) {
+        strcpy(fb_files[fb_file_count], "..");
+        fb_is_dir[fb_file_count] = 1;
+        fb_file_count++;
+    }
+
+    /* Read directory entries */
+    while (fb_file_count < FB_MAX_FILES) {
+        memset(&buffer, 0, sizeof(buffer));
+        if (fs_readdir(dir_fd, &buffer) < 0) break;
+
+        /* Skip . and .. */
+        if (buffer.d_name[0] == '.' &&
+            (buffer.d_name[1] == '\0' ||
+             (buffer.d_name[1] == '.' && buffer.d_name[2] == '\0'))) {
+            continue;
+        }
+
+        int is_dir = S_ISDIR(buffer.type);
+        int is_avi = str_ends_with(buffer.d_name, ".avi");
+
+        /* Only show directories and .avi files */
+        if (!is_dir && !is_avi) continue;
+
+        /* Copy filename (truncate if needed) */
+        strncpy(fb_files[fb_file_count], buffer.d_name, FB_MAX_NAME - 1);
+        fb_files[fb_file_count][FB_MAX_NAME - 1] = '\0';
+        fb_is_dir[fb_file_count] = is_dir;
+        fb_file_count++;
+    }
+
+    fs_closedir(dir_fd);
+}
+
+static void fb_enter_selected(void) {
+    if (fb_file_count == 0) return;
+
+    if (fb_is_dir[fb_selection]) {
+        /* Enter directory */
+        if (strcmp(fb_files[fb_selection], "..") == 0) {
+            /* Go up - find last / */
+            char *last_slash = strrchr(fb_current_path, '/');
+            if (last_slash && last_slash != fb_current_path) {
+                *last_slash = '\0';
+            }
+        } else {
+            /* Enter subdirectory */
+            int len = strlen(fb_current_path);
+            if (len + 1 + strlen(fb_files[fb_selection]) < FB_MAX_PATH) {
+                strcat(fb_current_path, "/");
+                strcat(fb_current_path, fb_files[fb_selection]);
+            }
+        }
+        fb_scan_directory();
+    } else {
+        /* Load file */
+        char full_path[FB_MAX_PATH];
+        snprintf(full_path, FB_MAX_PATH, "%s/%s", fb_current_path, fb_files[fb_selection]);
+
+        if (load_avi_file(full_path) == 0) {
+            /* Success - close file browser and menu */
+            strcpy(loaded_file_path, full_path);
+            file_browser_active = 0;
+            menu_active = 0;
+            no_file_loaded = 0;
+            is_paused = 0;
+        }
+    }
+}
+
+static void draw_file_browser(void) {
+    int fb_x = 30;
+    int fb_y = 15;
+    int fb_w = 260;
+    int fb_h = 210;
+
+    pixel_t col_bg = 0x0000;
+    pixel_t col_border = 0xFFFF;
+    pixel_t col_title = 0xFFE0;
+    pixel_t col_file = 0xFFFF;
+    pixel_t col_dir = 0x07FF;
+    pixel_t col_sel = 0x001F;
+
+    /* Background */
+    draw_fill_rect(fb_x, fb_y, fb_x + fb_w, fb_y + fb_h, col_bg);
+    /* Border */
+    draw_rect(fb_x, fb_y, fb_x + fb_w, fb_y + fb_h, col_border);
+    draw_rect(fb_x + 1, fb_y + 1, fb_x + fb_w - 1, fb_y + fb_h - 1, col_border);
+
+    /* Title */
+    draw_str(fb_x + 8, fb_y + 5, "Load Video File", col_title);
+
+    /* Current path (truncated if too long, convert Polish chars) */
+    char path_display[40];
+    char path_latin[40];
+    int path_len = strlen(fb_current_path);
+    if (path_len > 38) {
+        strcpy(path_display, "...");
+        strcat(path_display, fb_current_path + path_len - 35);
+    } else {
+        strcpy(path_display, fb_current_path);
+    }
+    polish_to_latin(path_display, path_latin, 40);
+    draw_str(fb_x + 8, fb_y + 17, path_latin, 0x7BEF);
+
+    /* Separator */
+    draw_fill_rect(fb_x + 4, fb_y + 28, fb_x + fb_w - 4, fb_y + 29, col_border);
+
+    /* File list */
+    int list_y = fb_y + 34;
+    int item_height = 10;
+
+    for (int i = 0; i < FB_VISIBLE_ITEMS && (fb_scroll + i) < fb_file_count; i++) {
+        int idx = fb_scroll + i;
+        int y = list_y + i * item_height;
+
+        /* Selection highlight */
+        if (idx == fb_selection) {
+            draw_fill_rect(fb_x + 4, y - 1, fb_x + fb_w - 4, y + 8, col_sel);
+        }
+
+        /* Icon and filename (convert Polish chars for display) */
+        pixel_t col = fb_is_dir[idx] ? col_dir : col_file;
+        char display_name[45];
+        char display_latin[45];
+
+        if (fb_is_dir[idx]) {
+            snprintf(display_name, 44, "[%s]", fb_files[idx]);
+        } else {
+            strncpy(display_name, fb_files[idx], 44);
+            display_name[44] = '\0';
+        }
+        polish_to_latin(display_name, display_latin, 45);
+        draw_str(fb_x + 8, y, display_latin, col);
+    }
+
+    /* Scroll indicators */
+    if (fb_scroll > 0) {
+        draw_str(fb_x + fb_w - 20, list_y, "^", col_border);
+    }
+    if (fb_scroll + FB_VISIBLE_ITEMS < fb_file_count) {
+        draw_str(fb_x + fb_w - 20, list_y + (FB_VISIBLE_ITEMS - 1) * item_height, "v", col_border);
+    }
+
+    /* Instructions */
+    draw_str(fb_x + 8, fb_y + fb_h - 20, "A:Select B:Back", 0x7BEF);
+
+    /* File count */
+    char count_str[20];
+    snprintf(count_str, 20, "%d files", fb_file_count);
+    draw_str(fb_x + fb_w - 60, fb_y + fb_h - 20, count_str, 0x7BEF);
+}
 
 /* Draw menu overlay - Amiga style */
 static void draw_menu(void) {
     int menu_x = 50;
-    int menu_y = 20;
+    int menu_y = 5;    /* expanded up to fit 10 menu items */
     int menu_w = 220;
-    int menu_h = 216;
+    int menu_h = 232;  /* +10px for Save Settings option */
 
     /* Colors - Amiga Workbench inspired blueish palette */
     pixel_t col_bg = 0x0010;      /* dark blue background */
@@ -680,17 +1093,27 @@ static void draw_menu(void) {
     draw_fill_rect(menu_x + 4, menu_y + 4, menu_x + menu_w - 4, menu_y + 26, col_titlebar);
 
     /* Title text - shifted right by 2 chars to align with author */
-    draw_str(menu_x + 52, menu_y + 7, "A ZERO Player v0.71", col_title);
+    draw_str(menu_x + 52, menu_y + 7, "A ZERO Player v0.75", col_title);
     draw_str(menu_x + 50, menu_y + 17, "by Grzegorz Korycki", col_value);
 
-    /* Item 0: Go to Position (with slider) */
-    int go_y = menu_y + 34;
-    pixel_t go_col = (menu_selection == 0) ? col_sel : col_text;
+    /* Item 0: Load File */
+    int load_y = menu_y + 34;
+    pixel_t load_col = (menu_selection == 0) ? col_sel : col_text;
     if (menu_selection == 0) {
+        draw_fill_rect(menu_x + 6, load_y - 1, menu_x + menu_w - 6, load_y + 9, 0x0015);
+        draw_str(menu_x + 8, load_y, ">", col_sel);
+    }
+    draw_str(menu_x + 20, load_y, menu_labels[0], load_col);
+    draw_str(menu_x + 130, load_y, "[...]", col_value);
+
+    /* Item 1: Go to Position (with slider) */
+    int go_y = menu_y + 48;
+    pixel_t go_col = (menu_selection == 1) ? col_sel : col_text;
+    if (menu_selection == 1) {
         draw_fill_rect(menu_x + 6, go_y - 1, menu_x + menu_w - 6, go_y + 9, 0x0015);
         draw_str(menu_x + 8, go_y, ">", col_sel);
     }
-    draw_str(menu_x + 20, go_y, menu_labels[0], go_col);
+    draw_str(menu_x + 20, go_y, menu_labels[1], go_col);
 
     /* Seek slider */
     int slider_y = go_y + 14;
@@ -723,16 +1146,16 @@ static void draw_menu(void) {
     draw_num(slider_x + 118, slider_y + 14, total_frames, col_value);
 
     /* Hint when slider selected */
-    if (menu_selection == 0) {
+    if (menu_selection == 1) {
         draw_str(menu_x + 52, slider_y + 24, "L/R: Seek", col_hint);
     }
 
     /* Separator line after Go to Position */
-    draw_fill_rect(menu_x + 10, menu_y + 83, menu_x + menu_w - 10, menu_y + 84, col_border);
+    draw_fill_rect(menu_x + 10, menu_y + 97, menu_x + menu_w - 10, menu_y + 98, col_border);
 
-    /* Menu items 1-7 */
-    for (int i = 1; i < MENU_ITEMS; i++) {
-        int item_y = menu_y + 89 + (i - 1) * 14;
+    /* Menu items 2-8 */
+    for (int i = 2; i < MENU_ITEMS; i++) {
+        int item_y = menu_y + 103 + (i - 2) * 14;
         pixel_t col = (i == menu_selection) ? col_sel : col_text;
 
         if (i == menu_selection) {
@@ -742,15 +1165,17 @@ static void draw_menu(void) {
         draw_str(menu_x + 20, item_y, menu_labels[i], col);
 
         /* Show current state for items */
-        if (i == 1) {  /* Color Mode */
+        if (i == 2) {  /* Color Mode */
             draw_str(menu_x + 120, item_y, color_mode_names[color_mode], col_value);
-        } else if (i == 3) {  /* Show Time */
+        } else if (i == 4) {  /* Show Time */
             draw_str(menu_x + 150, item_y, show_time ? "[ON]" : "[OFF]", col_value);
-        } else if (i == 4) {  /* Debug Info */
+        } else if (i == 5) {  /* Debug Info */
             draw_str(menu_x + 150, item_y, show_debug ? "[ON]" : "[OFF]", col_value);
-        } else if (i == 6) {  /* Instructions - show arrow */
+        } else if (i == 7) {  /* Save Settings - disk icon */
+            draw_str(menu_x + 150, item_y, "[!]", col_value);
+        } else if (i == 8) {  /* Instructions - show arrow */
             draw_str(menu_x + 150, item_y, "[>]", col_value);
-        } else if (i == 7) {  /* About - yellow slash on white */
+        } else if (i == 9) {  /* About - yellow slash on white */
             draw_str(menu_x + 155, item_y, "/", 0xFFE0);  /* yellow slash */
         }
     }
@@ -1415,7 +1840,10 @@ static void play_audio_for_frame(void) {
     }
 
     /* Sync based on current_frame_idx (frames actually shown) */
-    uint64_t expected = (uint64_t)current_frame_idx * audio_sample_rate / clip_fps;
+    /* Add ~0.1s audio lead to compensate for video-ahead-of-audio sync issue */
+    /* At 22050Hz, 0.1s = 2205 samples. Using 2000 for round number. */
+    #define AUDIO_SYNC_OFFSET 2000
+    uint64_t expected = (uint64_t)current_frame_idx * audio_sample_rate / clip_fps + AUDIO_SYNC_OFFSET;
     int64_t to_send = expected - audio_samples_sent;
 
     if (to_send <= 0) return;
@@ -1493,10 +1921,16 @@ static int open_video(const char *path) {
     return 1;
 }
 
+/* Load AVI file from path - used by file browser */
+static int load_avi_file(const char *path) {
+    return open_video(path) ? 0 : -1;  /* return 0 on success, -1 on failure */
+}
+
 /* Libretro API */
 void retro_init(void) {
     memset(framebuffer, 0, sizeof(framebuffer));
     init_color_tables();
+    load_settings();  /* Load saved settings (color mode, show_time, etc.) */
 }
 void retro_deinit(void) { if (video_file) fclose(video_file); }
 unsigned retro_api_version(void) { return RETRO_API_VERSION; }
@@ -1505,7 +1939,7 @@ void retro_set_controller_port_device(unsigned p, unsigned d) { (void)p; (void)d
 void retro_get_system_info(struct retro_system_info *info) {
     memset(info, 0, sizeof(*info));
     info->library_name = "A ZERO Player";
-    info->library_version = "0.61";
+    info->library_version = "0.72";
     info->need_fullpath = 1;
     info->valid_extensions = "avi";
 }
@@ -1581,6 +2015,7 @@ void retro_run(void) {
                 menu_active = 0;
                 color_submenu_active = 0;  /* close any submenus */
                 submenu_active = 0;
+                file_browser_active = 0;  /* close file browser */
                 decode_single_frame(current_frame_idx);  /* refresh frame */
                 is_paused = was_paused_before_menu;  /* restore pause state */
                 if (!is_paused) {
@@ -1603,23 +2038,35 @@ void retro_run(void) {
         if (menu_active) {
             /* Handle color submenu (scrollable mode picker) */
             if (color_submenu_active) {
-                /* Up/Down to navigate modes */
+                /* Up/Down to navigate modes - wraps around */
                 if (cur_up && !prev_up) {
                     if (color_mode > 0) {
                         color_mode--;
-                        decode_single_frame(current_frame_idx);
-                        if (color_mode < color_submenu_scroll) {
-                            color_submenu_scroll = color_mode;
-                        }
+                    } else {
+                        color_mode = COLOR_MODE_COUNT - 1;  /* wrap to last */
+                    }
+                    decode_single_frame(current_frame_idx);
+                    /* Adjust scroll to keep selection visible */
+                    if (color_mode < color_submenu_scroll) {
+                        color_submenu_scroll = color_mode;
+                    }
+                    if (color_mode >= color_submenu_scroll + 8) {
+                        color_submenu_scroll = color_mode - 7;
                     }
                 }
                 if (cur_down && !prev_down) {
                     if (color_mode < COLOR_MODE_COUNT - 1) {
                         color_mode++;
-                        decode_single_frame(current_frame_idx);
-                        if (color_mode >= color_submenu_scroll + 8) {
-                            color_submenu_scroll = color_mode - 7;
-                        }
+                    } else {
+                        color_mode = 0;  /* wrap to first */
+                    }
+                    decode_single_frame(current_frame_idx);
+                    /* Adjust scroll to keep selection visible */
+                    if (color_mode >= color_submenu_scroll + 8) {
+                        color_submenu_scroll = color_mode - 7;
+                    }
+                    if (color_mode < color_submenu_scroll) {
+                        color_submenu_scroll = color_mode;
                     }
                 }
                 /* A or B to close */
@@ -1627,6 +2074,44 @@ void retro_run(void) {
                     color_submenu_active = 0;
                 }
                 /* L/R shoulders do nothing in color submenu */
+            }
+            /* Handle file browser navigation */
+            else if (file_browser_active) {
+                /* Up/Down to navigate files */
+                if (cur_up && !prev_up) {
+                    if (fb_selection > 0) {
+                        fb_selection--;
+                        if (fb_selection < fb_scroll) {
+                            fb_scroll = fb_selection;
+                        }
+                    }
+                }
+                if (cur_down && !prev_down) {
+                    if (fb_selection < fb_file_count - 1) {
+                        fb_selection++;
+                        if (fb_selection >= fb_scroll + FB_VISIBLE_ITEMS) {
+                            fb_scroll = fb_selection - FB_VISIBLE_ITEMS + 1;
+                        }
+                    }
+                }
+                /* A to enter directory or load file */
+                if (cur_a && !prev_a) {
+                    fb_enter_selected();
+                }
+                /* B to go back (parent directory or close browser) */
+                if (cur_b && !prev_b) {
+                    /* Try to go to parent directory */
+                    char *last_slash = strrchr(fb_current_path, '/');
+                    if (last_slash && last_slash != fb_current_path) {
+                        *last_slash = '\0';
+                        fb_selection = 0;
+                        fb_scroll = 0;
+                        fb_scan_directory();
+                    } else {
+                        /* At root or /mnt - close file browser */
+                        file_browser_active = 0;
+                    }
+                }
             }
             /* Handle other submenus */
             else if (submenu_active > 0) {
@@ -1639,9 +2124,11 @@ void retro_run(void) {
                 /* Menu navigation with Up/Down */
                 if (cur_up && !prev_up) {
                     menu_selection = (menu_selection - 1 + MENU_ITEMS) % MENU_ITEMS;
+                    save_feedback_timer = 0;  /* hide popup on navigation */
                 }
                 if (cur_down && !prev_down) {
                     menu_selection = (menu_selection + 1) % MENU_ITEMS;
+                    save_feedback_timer = 0;  /* hide popup on navigation */
                 }
 
                 /* L/R shoulders for cycling options (d-pad removed - too easy to trigger accidentally) */
@@ -1651,7 +2138,7 @@ void retro_run(void) {
                 /* Handle option cycling based on menu selection */
                 if (cycle_prev || cycle_next) {
                     switch (menu_selection) {
-                        case 1:  /* Color Mode */
+                        case 2:  /* Color Mode */
                             if (cycle_next) {
                                 color_mode = (color_mode + 1) % COLOR_MODE_COUNT;
                             } else {
@@ -1659,17 +2146,17 @@ void retro_run(void) {
                             }
                             decode_single_frame(current_frame_idx);
                             break;
-                        case 3:  /* Show Time */
+                        case 4:  /* Show Time */
                             show_time = !show_time;
                             break;
-                        case 4:  /* Debug Info */
+                        case 5:  /* Debug Info */
                             show_debug = !show_debug;
                             break;
                     }
                 }
 
-                /* Slider control for Go to Position (item 0) - only Left/Right */
-                if (menu_selection == 0) {
+                /* Slider control for Go to Position (item 1) - only Left/Right */
+                if (menu_selection == 1) {
                     if (cur_left && !prev_left) {
                         if (seek_position > 0) {
                             seek_position--;
@@ -1690,7 +2177,11 @@ void retro_run(void) {
                 /* Menu action on A */
                 if (cur_a && !prev_a) {
                     switch (menu_selection) {
-                        case 0:  /* Go to Position - close menu and resume */
+                        case 0:  /* Load File - open file browser */
+                            file_browser_active = 1;
+                            fb_scan_directory();
+                            break;
+                        case 1:  /* Go to Position - close menu and resume */
                             is_paused = was_paused_before_menu;
                             menu_active = 0;
                             if (!is_paused) {
@@ -1698,7 +2189,7 @@ void retro_run(void) {
                                 icon_timer = ICON_FRAMES;
                             }
                             break;
-                        case 1:  /* Color Mode - open submenu */
+                        case 2:  /* Color Mode - open submenu */
                             color_submenu_active = 1;
                             /* Scroll to show current mode in view */
                             color_submenu_scroll = color_mode - 3;
@@ -1706,7 +2197,7 @@ void retro_run(void) {
                             if (color_submenu_scroll > COLOR_MODE_COUNT - 8)
                                 color_submenu_scroll = COLOR_MODE_COUNT - 8;
                             break;
-                        case 2:  /* Resume - unpause and close menu */
+                        case 3:  /* Resume - unpause and close menu */
                             is_paused = 0;
                             was_paused_before_menu = 0;
                             icon_type = ICON_PLAY;
@@ -1714,13 +2205,13 @@ void retro_run(void) {
                             menu_active = 0;
                             decode_single_frame(current_frame_idx);
                             break;
-                        case 3:  /* Show Time toggle */
+                        case 4:  /* Show Time toggle */
                             show_time = !show_time;
                             break;
-                        case 4:  /* Debug Info toggle */
+                        case 5:  /* Debug Info toggle */
                             show_debug = !show_debug;
                             break;
-                        case 5:  /* Restart */
+                        case 6:  /* Restart */
                             seek_to_frame(0);
                             is_paused = 0;
                             was_paused_before_menu = 0;
@@ -1728,10 +2219,14 @@ void retro_run(void) {
                             icon_timer = ICON_FRAMES;
                             menu_active = 0;
                             break;
-                        case 6:  /* Instructions */
+                        case 7:  /* Save Settings */
+                            save_settings();
+                            save_feedback_timer = SAVE_FEEDBACK_FRAMES;
+                            break;
+                        case 8:  /* Instructions */
                             submenu_active = 1;
                             break;
-                        case 7:  /* About */
+                        case 9:  /* About */
                             submenu_active = 2;
                             break;
                     }
@@ -1938,6 +2433,34 @@ void retro_run(void) {
     /* Draw menu overlay on top */
     if (menu_active) {
         draw_menu();
+        /* Draw file browser on top of menu when active */
+        if (file_browser_active) {
+            draw_file_browser();
+        }
+        /* Draw save feedback popup */
+        if (save_feedback_timer > 0) {
+            int popup_x = 80;
+            int popup_y = 100;
+            int popup_w = 160;
+            int popup_h = 40;
+            /* Dark background with border */
+            draw_fill_rect(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h, 0x0000);
+            draw_rect(popup_x, popup_y, popup_x + popup_w, popup_y + popup_h, 0x07E0);
+            draw_rect(popup_x + 1, popup_y + 1, popup_x + popup_w - 1, popup_y + popup_h - 1, 0x07E0);
+            /* Message */
+            draw_str(popup_x + 20, popup_y + 12, "Settings Saved!", 0x07E0);
+            draw_str(popup_x + 45, popup_y + 26, "a0player.cfg", 0x7BEF);
+            save_feedback_timer--;
+        }
+    }
+
+    /* No file message when opened without file */
+    if (no_file_loaded && !menu_active) {
+        /* Black background */
+        memset(framebuffer, 0, SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(pixel_t));
+        /* Center message */
+        draw_str(110, 110, "No file loaded", 0xFFFF);
+        draw_str(80, 130, "Press START to open menu", 0x7BEF);
     }
 
     /* Draw visual feedback icon */
@@ -1955,7 +2478,22 @@ void retro_run(void) {
 bool retro_load_game(const struct retro_game_info *info) {
     enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
     if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) return false;
-    if (info && info->path) open_video(info->path);
+
+    /* Ensure VIDEOS directory exists */
+    fb_ensure_videos_dir();
+
+    if (info && info->path && info->path[0] != '\0') {
+        if (open_video(info->path)) {
+            strcpy(loaded_file_path, info->path);
+            no_file_loaded = 0;
+        } else {
+            no_file_loaded = 1;
+        }
+    } else {
+        /* No file provided - show file browser on start */
+        no_file_loaded = 1;
+        is_paused = 1;
+    }
     return true;
 }
 

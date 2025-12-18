@@ -1,4 +1,8 @@
-STATIC_LINKING := 0
+# PMP091 - A ZERO Player with Xvid MPEG-4 + libmad MP3 Support
+# SF2000 Libretro Makefile
+# Much simpler than FFmpeg version!
+
+STATIC_LINKING := 1
 AR             := ar
 
 ifeq ($(platform),)
@@ -9,144 +13,144 @@ else ifneq ($(findstring MINGW,$(shell uname -a)),)
    platform = win
 else ifneq ($(findstring Darwin,$(shell uname -a)),)
    platform = osx
-else ifneq ($(findstring win,$(shell uname -a)),)
-   platform = win
 endif
 endif
 
-# system platform
-system_platform = unix
-ifeq ($(shell uname -a),)
-	EXE_EXT = .exe
-	system_platform = win
-else ifneq ($(findstring Darwin,$(shell uname -a)),)
-	system_platform = osx
-	arch = intel
-ifeq ($(shell uname -p),powerpc)
-	arch = ppc
-endif
-else ifneq ($(findstring MINGW,$(shell uname -a)),)
-	system_platform = win
-endif
+TARGET_NAME := pmp
+LIBM        := -lm
 
-TARGET_NAME := pmp075
-LIBM		= -lm
-
-ifeq ($(ARCHFLAGS),)
-ifeq ($(archs),ppc)
-   ARCHFLAGS = -arch ppc -arch ppc64
-else
-   ARCHFLAGS = -arch i386 -arch x86_64
-endif
-endif
-
-ifeq ($(platform), osx)
-ifndef ($(NOUNIVERSAL))
-   CFLAGS += $(ARCHFLAGS)
-   LFLAGS += $(ARCHFLAGS)
-endif
-endif
-
-ifeq ($(STATIC_LINKING), 1)
-EXT := a
-endif
-
-ifeq ($(platform), unix)
-	EXT ?= so
-   TARGET := $(TARGET_NAME)_libretro.$(EXT)
-   fpic := -fPIC
-   SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined
-else ifeq ($(platform), linux-portable)
-   TARGET := $(TARGET_NAME)_libretro.$(EXT)
-   fpic := -fPIC -nostdlib
-   SHARED := -shared -Wl,--version-script=link.T
-	LIBM :=
-else ifneq (,$(findstring osx,$(platform)))
-   TARGET := $(TARGET_NAME)_libretro.dylib
-   fpic := -fPIC
-   SHARED := -dynamiclib
-else ifneq (,$(findstring ios,$(platform)))
-   TARGET := $(TARGET_NAME)_libretro_ios.dylib
-	fpic := -fPIC
-	SHARED := -dynamiclib
-
-ifeq ($(IOSSDK),)
-   IOSSDK := $(shell xcodebuild -version -sdk iphoneos Path)
-endif
-
-	DEFINES := -DIOS
-	CC = cc -arch armv7 -isysroot $(IOSSDK)
-ifeq ($(platform),ios9)
-CC     += -miphoneos-version-min=8.0
-CFLAGS += -miphoneos-version-min=8.0
-else
-CC     += -miphoneos-version-min=5.0
-CFLAGS += -miphoneos-version-min=5.0
-endif
-else ifneq (,$(findstring qnx,$(platform)))
-	TARGET := $(TARGET_NAME)_libretro_qnx.so
-   fpic := -fPIC
-   SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined
-else ifeq ($(platform), emscripten)
-   TARGET := $(TARGET_NAME)_libretro_emscripten.bc
-   fpic := -fPIC
-   SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined
-else ifeq ($(platform), vita)
-   TARGET := $(TARGET_NAME)_vita.a
-   CC = arm-vita-eabi-gcc
-   AR = arm-vita-eabi-ar
-   CFLAGS += -Wl,-q -Wall -O3
-	STATIC_LINKING = 1
-# SF2000
-else ifeq ($(platform), sf2000)
+# =============================================================
+# SF2000 Platform
+# =============================================================
+ifeq ($(platform), sf2000)
    TARGET := $(TARGET_NAME)_libretro_$(platform).a
-   MIPS:=/tmp/mips32-mti-elf/2019.09-03-2/bin/mips-mti-elf-
+   MIPS := /tmp/mips32-mti-elf/2019.09-03-2/bin/mips-mti-elf-
    CC = $(MIPS)gcc
    CXX = $(MIPS)g++
    AR = $(MIPS)ar
+
+   # MIPS32 flags - soft-float, no FPU
    CFLAGS = -EL -march=mips32 -mtune=mips32 -msoft-float -ffast-math -fomit-frame-pointer
-   CFLAGS += -G0 -mno-abicalls -fno-pic 
+   CFLAGS += -G0 -mno-abicalls -fno-pic
    CFLAGS += -ffunction-sections -fdata-sections
-   CFLAGS += -I.
+
+   # Include paths
+   CFLAGS += -I. -Ixvid -Ixvid/bitstream -Ixvid/dct -Ixvid/image
+   CFLAGS += -Ixvid/motion -Ixvid/prediction -Ixvid/quant -Ixvid/utils
+   CFLAGS += -Ilibmad
+
+   # Defines for SF2000
    CFLAGS += -DSF2000
+   # libmad: FPM_DEFAULT is hardcoded in froggyMP3's fixed.h
+
    STATIC_LINKING = 1
+
+# =============================================================
+# Unix (for testing compilation)
+# =============================================================
+else ifeq ($(platform), unix)
+   TARGET := $(TARGET_NAME)_libretro.so
+   fpic := -fPIC
+   SHARED := -shared -Wl,--no-undefined
+   CFLAGS += -I. -Ixvid -Ixvid/bitstream -Ixvid/dct -Ixvid/image
+   CFLAGS += -Ixvid/motion -Ixvid/prediction -Ixvid/quant -Ixvid/utils
+
+# =============================================================
+# Windows
+# =============================================================
 else
-   CC = gcc
    TARGET := $(TARGET_NAME)_libretro.dll
-   SHARED := -shared -static-libgcc -static-libstdc++ -s -Wl,--version-script=link.T -Wl,--no-undefined
+   CC = gcc
+   SHARED := -shared -static-libgcc -s -Wl,--no-undefined
+   CFLAGS += -I. -Ixvid
 endif
 
-LDFLAGS += $(LIBM)
-
+# Optimization
 ifeq ($(DEBUG), 1)
-   CFLAGS += -O0 -g
+   CFLAGS += -O0 -g -DDEBUG
 else
-   CFLAGS += -O3
+   CFLAGS += -O2
 endif
 
-OBJECTS := libretro-pmp.o tjpgd.o
-CFLAGS += -I. -Wall $(fpic)
+CFLAGS += -Wall -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable
 
-ifneq (,$(findstring qnx,$(platform)))
-CFLAGS += -Wc,-std=c99
-else
-CFLAGS += -std=gnu99
-endif
+# =============================================================
+# Xvid decoder source files (decoder only, no encoder!)
+# =============================================================
+OBJS_XVID = \
+	xvid/xvid.o \
+	xvid/decoder.o \
+	xvid/bitstream/bitstream.o \
+	xvid/bitstream/cbp.o \
+	xvid/bitstream/mbcoding.o \
+	xvid/dct/idct.o \
+	xvid/dct/simple_idct.o \
+	xvid/image/colorspace.o \
+	xvid/image/image.o \
+	xvid/image/interpolate8x8.o \
+	xvid/image/postprocessing.o \
+	xvid/image/qpel.o \
+	xvid/image/reduced.o \
+	xvid/image/font.o \
+	xvid/motion/gmc.o \
+	xvid/motion/motion_comp.o \
+	xvid/motion/sad.o \
+	xvid/prediction/mbprediction.o \
+	xvid/quant/quant_h263.o \
+	xvid/quant/quant_matrix.o \
+	xvid/quant/quant_mpeg.o \
+	xvid/utils/emms.o \
+	xvid/utils/mem_align.o \
+	xvid/utils/mem_transfer.o
+
+# =============================================================
+# TJpgDec for MJPEG
+# =============================================================
+OBJS_TJPGD = tjpgd.o
+
+# =============================================================
+# libmad MP3 decoder (fixed-point, MIPS optimized)
+# =============================================================
+OBJS_LIBMAD = \
+	libmad/bit.o \
+	libmad/fixed.o \
+	libmad/frame.o \
+	libmad/huffman.o \
+	libmad/layer12.o \
+	libmad/layer3.o \
+	libmad/libmad.o \
+	libmad/stream.o \
+	libmad/synth.o \
+	libmad/timer.o
+
+# =============================================================
+# Main libretro wrapper
+# =============================================================
+OBJS_MAIN = libretro-pmp.o
+
+# =============================================================
+# All objects
+# =============================================================
+OBJS = $(OBJS_MAIN) $(OBJS_TJPGD) $(OBJS_XVID) $(OBJS_LIBMAD)
+
+# =============================================================
+# Build rules
+# =============================================================
 
 all: $(TARGET)
 
-$(TARGET): $(OBJECTS)
+$(TARGET): $(OBJS)
 ifeq ($(STATIC_LINKING), 1)
-	$(AR) rcs $@ $(OBJECTS)
+	$(AR) rcs $@ $(OBJS)
 else
-	$(CC) $(fpic) $(SHARED) $(INCLUDES) -o $@ $(OBJECTS) $(LDFLAGS)
+	$(CC) $(fpic) $(SHARED) -o $@ $(OBJS) $(LDFLAGS) $(LIBM)
 endif
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(fpic) -c -o $@ $<
 
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	rm -f $(OBJS) $(TARGET)
+	find . -name "*.o" -type f -delete 2>/dev/null || true
 
-.PHONY: clean
-
+.PHONY: clean all

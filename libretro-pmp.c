@@ -1,18 +1,18 @@
 /*
- * PMP072 - A ZERO Player
- * - FAST video player with idx1 index support
- * - Auto-detect offset format
+ * A ZERO Player - Video player for SF2000
+ * - MJPEG support via TJpgDec (fast, simple)
+ * - MPEG-4 Part 2 (XviD/DivX) support via Xvid library
+ * - MP3 audio support via libmad
+ * - Auto-detect codec from AVI fourcc
  * - Supports 3+ hour videos at 30fps (360000 frames)
  * - Amiga-style menu UI with Instructions & About
- * - Lock/unlock icons (key shape)
- * - LUT optimization for YCbCr->RGB (no multiplications)
- * - Color modes: Unchanged, Lifted, Gamma, Dithered, Warm, Night, Legacy
- * - Scrollable color mode submenu
- * - Dither2/Night+Dither2 modes (dither black for smooth transitions)
- * - Enhanced warm tint (more visible red shift)
  * - Built-in file browser (load videos from SD card)
  * by Grzegorz Korycki
  */
+
+/* ========== VERSION - CHANGE HERE ========== */
+#define PLAYER_VERSION "1.20"
+/* ============================================ */
 
 #include "libretro.h"
 #include "tjpgd.h"
@@ -22,6 +22,49 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <math.h>
+
+/* Debug logging for SF2000 */
+extern void xlog(const char *fmt, ...);
+
+/* Xvid includes for MPEG-4 decoding */
+#include "xvid/xvid.h"
+
+/* libmad includes for MP3 decoding */
+#include "libmad/libmad.h"
+
+/* Video codec types */
+#define CODEC_TYPE_UNKNOWN  0
+#define CODEC_TYPE_MJPEG    1
+#define CODEC_TYPE_MPEG4    2
+static int video_codec_type = CODEC_TYPE_UNKNOWN;
+static char video_fourcc[5] = {0};  /* For debug display */
+static int mpeg4_error_shown = 0;   /* For "not supported" message */
+
+/* Xvid decoder state */
+static void *xvid_handle = NULL;
+static int xvid_initialized = 0;
+
+/* YUV frame buffer for MPEG-4 (Xvid outputs YUV420P) */
+#define MAX_VIDEO_WIDTH 480
+#define MAX_VIDEO_HEIGHT 320
+static int xvid_width = 0, xvid_height = 0;
+
+/* YUV buffer for Xvid output */
+static uint8_t *yuv_buffer = NULL;
+static uint8_t *yuv_y = NULL;
+static uint8_t *yuv_u = NULL;
+static uint8_t *yuv_v = NULL;
+
+/* MPEG-4 extradata (VOL header from AVI strf chunk) */
+#define MAX_EXTRADATA_SIZE 256
+static uint8_t mpeg4_extradata[MAX_EXTRADATA_SIZE];
+static int mpeg4_extradata_size = 0;
+static int mpeg4_extradata_sent = 0;  /* Flag: was extradata sent to decoder? */
+
+/* Debug info for MPEG-4 */
+static int debug_strf_size = 0;  /* shsize from strf chunk */
+static uint8_t debug_first_frame[20];  /* First 20 bytes of first video frame */
+static int debug_first_frame_saved = 0;
 
 /* SF2000 filesystem functions - DO NOT use standard fopen/fread! */
 #define FS_O_RDONLY     0x0000
@@ -53,12 +96,12 @@ extern ssize_t fs_readdir(int fd, void *buffer);
 #define MAX_JPEG_SIZE (64 * 1024)
 #define TJPGD_WORKSPACE_SIZE 4096
 
-/* Audio settings */
-#define AUDIO_SAMPLE_RATE 22050
-#define MAX_AUDIO_BUFFER 2048
+/* Audio settings - support 11025, 22050, 44100 Hz */
+#define AUDIO_SAMPLE_RATE 44100  /* Report max to libretro, actual rate from file */
+#define MAX_AUDIO_BUFFER 4096   /* Larger for 44kHz */
 
-/* Audio ring buffer: ~1 second (like 042) */
-#define AUDIO_RING_SIZE (22050 * 2)
+/* Audio ring buffer: ~1 second at max rate (44100 * 2 channels * 2 bytes) */
+#define AUDIO_RING_SIZE (44100 * 4)
 #define AUDIO_REFILL_THRESHOLD (AUDIO_RING_SIZE / 2)
 
 typedef uint16_t pixel_t;
@@ -110,11 +153,170 @@ static uint64_t audio_samples_sent = 0;
 static uint32_t total_audio_bytes = 0;
 
 /* Audio format */
+#define AUDIO_FMT_PCM    1
+#define AUDIO_FMT_ADPCM  2
+#define AUDIO_FMT_MP3    3
+static int audio_format = 0;
 static int audio_channels = 0;
 static int audio_sample_rate = 0;
 static int audio_bits = 0;
 static int audio_bytes_per_sample = 0;
 static int has_audio = 0;
+
+/* MS ADPCM support */
+static int adpcm_block_align = 0;
+static int adpcm_samples_per_block = 0;
+
+/* MS ADPCM adaptation table */
+static const int adpcm_adapt_table[16] = {
+    230, 230, 230, 230, 307, 409, 512, 614,
+    768, 614, 512, 409, 307, 230, 230, 230
+};
+
+/* MS ADPCM coefficient table (standard 7 pairs) */
+static const int adpcm_coef1[7] = { 256, 512, 0, 192, 240, 460, 392 };
+static const int adpcm_coef2[7] = { 0, -256, 0, 64, 0, -208, -232 };
+
+/* ADPCM decoder state (per channel) */
+static int adpcm_sample1[2] = {0, 0};
+static int adpcm_sample2[2] = {0, 0};
+static int adpcm_delta[2] = {0, 0};
+static int adpcm_coef_idx[2] = {0, 0};
+
+/* Decode buffer for ADPCM */
+#define ADPCM_DECODE_BUF_SIZE 16384  /* Large enough for 44kHz stereo blocks */
+static int16_t adpcm_decode_buf[ADPCM_DECODE_BUF_SIZE];
+
+/* MP3 decoder state (froggyMP3 wrapper) */
+static void *mp3_handle = NULL;
+static int mp3_initialized = 0;
+/* Detected MP3 format (from first frame decode) */
+static int mp3_detected_samplerate = 0;  /* Actual sample rate from MP3 (e.g. 22050, 44100) */
+static int mp3_detected_channels = 0;    /* Actual channels from MP3 (1=mono, 2=stereo) */
+
+/* MP3 input buffer - need enough for full MP3 frame + overlap */
+#define MP3_INPUT_BUF_SIZE 8192
+static uint8_t mp3_input_buf[MP3_INPUT_BUF_SIZE];
+static int mp3_input_len = 0;       /* Valid bytes in input buffer */
+static int mp3_input_remaining = 0; /* Bytes not yet consumed */
+
+/* Decode buffer for MP3 (stereo 16-bit PCM) */
+#define MP3_DECODE_BUF_SIZE 8192
+static int16_t mp3_decode_buf[MP3_DECODE_BUF_SIZE];
+
+/* MP3 debug counters */
+static int mp3_debug_frames = 0;      /* Frames decoded */
+static int mp3_debug_errors = 0;      /* Decode errors */
+static int mp3_debug_bytes = 0;       /* Bytes to ring buffer */
+static int mp3_debug_fill = 0;        /* Input buffer fills */
+static int mp3_debug_sent = 0;        /* Samples sent to libretro */
+static int mp3_debug_ring = 0;        /* Ring buffer count snapshot */
+static int16_t mp3_debug_sample = 0;  /* First sample value for debug */
+static int16_t mp3_debug_dec_smp = 0; /* Sample right after decode */
+static int16_t mp3_debug_ring_smp = 0; /* Sample from ring buffer */
+static int mp3_debug_pcm_len = 0;     /* mp3_synth.pcm.length */
+static int mp3_debug_pcm_ch = 0;      /* mp3_synth.pcm.channels */
+static int mp3_debug_raw_hi = 0;      /* High 16 bits of raw mad_fixed_t */
+static int mp3_debug_out_smp = 0;     /* out_samples count */
+/* Clamp to 16-bit signed */
+static inline int16_t clamp16(int v) {
+    if (v < -32768) return -32768;
+    if (v > 32767) return 32767;
+    return (int16_t)v;
+}
+
+/* Decode one MS ADPCM sample - nibble is unsigned 0-15 */
+static inline int16_t decode_adpcm_sample(int nibble, int ch) {
+    /* Save unsigned nibble for adaptation table lookup */
+    int unsigned_nibble = nibble & 0xF;
+
+    /* Calculate predictor from previous samples */
+    int pred = ((adpcm_sample1[ch] * adpcm_coef1[adpcm_coef_idx[ch]]) +
+                (adpcm_sample2[ch] * adpcm_coef2[adpcm_coef_idx[ch]])) >> 8;
+
+    /* Sign extend nibble: 0-7 stays, 8-15 becomes -8 to -1 */
+    int signed_nibble = (nibble & 0x8) ? (nibble - 16) : nibble;
+
+    /* Calculate sample */
+    int sample = pred + signed_nibble * adpcm_delta[ch];
+    sample = clamp16(sample);
+
+    /* Update sample history */
+    adpcm_sample2[ch] = adpcm_sample1[ch];
+    adpcm_sample1[ch] = sample;
+
+    /* Adapt delta using UNSIGNED nibble for table lookup */
+    adpcm_delta[ch] = (adpcm_adapt_table[unsigned_nibble] * adpcm_delta[ch]) >> 8;
+    if (adpcm_delta[ch] < 16) adpcm_delta[ch] = 16;
+
+    return sample;
+}
+
+/* Decode one MS ADPCM block (mono) */
+static int decode_adpcm_block_mono(uint8_t *src, int src_size, int16_t *dst, int max_samples) {
+    if (src_size < 7) return 0;  /* Minimum block header */
+
+    /* Block header: predictor(1) + delta(2) + sample1(2) + sample2(2) = 7 bytes */
+    adpcm_coef_idx[0] = src[0];
+    if (adpcm_coef_idx[0] > 6) adpcm_coef_idx[0] = 0;
+
+    adpcm_delta[0] = (int16_t)(src[1] | (src[2] << 8));
+    adpcm_sample1[0] = (int16_t)(src[3] | (src[4] << 8));
+    adpcm_sample2[0] = (int16_t)(src[5] | (src[6] << 8));
+
+    int out_idx = 0;
+
+    /* First two samples from header (in reverse order) */
+    if (out_idx < max_samples) dst[out_idx++] = adpcm_sample2[0];
+    if (out_idx < max_samples) dst[out_idx++] = adpcm_sample1[0];
+
+    /* Decode nibbles */
+    for (int i = 7; i < src_size && out_idx < max_samples; i++) {
+        dst[out_idx++] = decode_adpcm_sample((src[i] >> 4) & 0xF, 0);
+        if (out_idx < max_samples)
+            dst[out_idx++] = decode_adpcm_sample(src[i] & 0xF, 0);
+    }
+
+    return out_idx;
+}
+
+/* Decode one MS ADPCM block (stereo) */
+static int decode_adpcm_block_stereo(uint8_t *src, int src_size, int16_t *dst, int max_samples) {
+    if (src_size < 14) return 0;  /* Minimum stereo block header */
+
+    /* Block header for stereo: pred0, pred1, delta0(2), delta1(2), s1_0(2), s1_1(2), s2_0(2), s2_1(2) = 14 bytes */
+    adpcm_coef_idx[0] = src[0];
+    adpcm_coef_idx[1] = src[1];
+    if (adpcm_coef_idx[0] > 6) adpcm_coef_idx[0] = 0;
+    if (adpcm_coef_idx[1] > 6) adpcm_coef_idx[1] = 0;
+
+    adpcm_delta[0] = (int16_t)(src[2] | (src[3] << 8));
+    adpcm_delta[1] = (int16_t)(src[4] | (src[5] << 8));
+    adpcm_sample1[0] = (int16_t)(src[6] | (src[7] << 8));
+    adpcm_sample1[1] = (int16_t)(src[8] | (src[9] << 8));
+    adpcm_sample2[0] = (int16_t)(src[10] | (src[11] << 8));
+    adpcm_sample2[1] = (int16_t)(src[12] | (src[13] << 8));
+
+    int out_idx = 0;
+
+    /* First two sample pairs from header */
+    if (out_idx + 1 < max_samples) {
+        dst[out_idx++] = adpcm_sample2[0];
+        dst[out_idx++] = adpcm_sample2[1];
+    }
+    if (out_idx + 1 < max_samples) {
+        dst[out_idx++] = adpcm_sample1[0];
+        dst[out_idx++] = adpcm_sample1[1];
+    }
+
+    /* Decode nibble pairs (L in high nibble, R in low nibble) */
+    for (int i = 14; i < src_size && out_idx + 1 < max_samples; i++) {
+        dst[out_idx++] = decode_adpcm_sample((src[i] >> 4) & 0xF, 0);
+        dst[out_idx++] = decode_adpcm_sample(src[i] & 0xF, 1);
+    }
+
+    return out_idx;
+}
 
 /* Repeat timing (15fps content on 30fps display) */
 static int repeat_count = 1;
@@ -180,8 +382,20 @@ static uint8_t gamma_r5[COLOR_MODE_COUNT][32];
 static uint8_t gamma_g6[COLOR_MODE_COUNT][64];
 static uint8_t gamma_b5[COLOR_MODE_COUNT][32];  /* separate B for warm modes */
 
+/* Xvid YUV->RGB lookup tables (much faster than per-pixel math!) */
+/* Two Y tables for output range selection */
+#define XVID_BLACK_TV   0   /* Output 0-255: expand source 16-235 to full range (default) */
+#define XVID_BLACK_PC   1   /* Output 16-235: keep source as-is (limited range) */
+static int xvid_black_level = XVID_BLACK_TV;  /* default: full 0-255 output */
+static int16_t yuv_y_table[2][256];   /* Y contribution (limited vs full range) */
+static int16_t yuv_rv_table[256];     /* V contribution to R: 1.402*(V-128) */
+static int16_t yuv_gu_table[256];     /* U contribution to G: -0.344*(U-128) */
+static int16_t yuv_gv_table[256];     /* V contribution to G: -0.714*(V-128) */
+static int16_t yuv_bu_table[256];     /* U contribution to B: 1.772*(U-128) */
+static int yuv_tables_initialized = 0;
+
 /* Menu overlay */
-#define MENU_ITEMS 10
+#define MENU_ITEMS 11
 static int menu_active = 0;
 static int menu_selection = 0;
 static int prev_start = 0;
@@ -198,13 +412,14 @@ static const char *menu_labels[MENU_ITEMS] = {
     "Load File",       /* 0 */
     "Go to Position",  /* 1 */
     "Color Mode",      /* 2 */
-    "Resume",          /* 3 */
-    "Show Time",       /* 4 */
-    "Debug Info",      /* 5 */
-    "Restart",         /* 6 */
-    "Save Settings",   /* 7 - NEW */
-    "Instructions",    /* 8 */
-    "About"            /* 9 */
+    "Xvid Range",      /* 3 - YUV range: 16-235 (standard) vs 0-255 (full) */
+    "Resume",          /* 4 */
+    "Show Time",       /* 5 */
+    "Debug Info",      /* 6 */
+    "Restart",         /* 7 */
+    "Save Settings",   /* 8 */
+    "Instructions",    /* 9 */
+    "About"            /* 10 */
 };
 
 /* File browser */
@@ -375,6 +590,36 @@ static void init_color_tables(void) {
         /* Legacy - identity (LUT not used, but fill anyway) */
         gamma_g6[COLOR_MODE_LEGACY][i] = i;
     }
+}
+
+/* Initialize YUV->RGB lookup tables for fast Xvid decoding */
+static void init_yuv_tables(void) {
+    if (yuv_tables_initialized) return;
+
+    for (int i = 0; i < 256; i++) {
+        /* Y table for TV/Limited range (16-235 -> 0-255) */
+        /* Formula: Y' = (Y - 16) * 255 / 219 = (Y - 16) * 298 / 256 */
+        int y_limited = ((i - 16) * 298) >> 8;
+        if (y_limited < 0) y_limited = 0;
+        if (y_limited > 255) y_limited = 255;
+        yuv_y_table[XVID_BLACK_TV][i] = y_limited;
+
+        /* Y table for PC/Full range (0-255 as-is) */
+        yuv_y_table[XVID_BLACK_PC][i] = i;
+
+        /* U/V contributions (same for both modes) */
+        /* BT.601 coefficients for full-range output: */
+        /* R = Y' + 1.402 * (V-128) */
+        /* G = Y' - 0.344 * (U-128) - 0.714 * (V-128) */
+        /* B = Y' + 1.772 * (U-128) */
+        int uv = i - 128;  /* center at 0 */
+        yuv_rv_table[i] = (1436 * uv) >> 10;   /* 1.402 * 1024 = 1436 */
+        yuv_gu_table[i] = (-352 * uv) >> 10;   /* -0.344 * 1024 = -352 */
+        yuv_gv_table[i] = (-731 * uv) >> 10;   /* -0.714 * 1024 = -731 */
+        yuv_bu_table[i] = (1815 * uv) >> 10;   /* 1.772 * 1024 = 1815 */
+    }
+
+    yuv_tables_initialized = 1;
 }
 
 static void draw_char(int x, int y, char c, pixel_t col) {
@@ -718,10 +963,11 @@ static void save_settings(void) {
     int len = snprintf(buf, 512,
         "# A ZERO Player settings\n"
         "color_mode=%d\n"
+        "xvid_black=%d\n"
         "show_time=%d\n"
         "show_debug=%d\n"
         "last_dir=%s\n",
-        color_mode, show_time, show_debug, fb_current_path);
+        color_mode, xvid_black_level, show_time, show_debug, fb_current_path);
 
     fs_write(fd, buf, len);
     fs_close(fd);
@@ -768,6 +1014,9 @@ static void load_settings(void) {
                 int v = 0;
                 while (*val >= '0' && *val <= '9') v = v * 10 + (*val++ - '0');
                 if (v >= 0 && v < COLOR_MODE_COUNT) color_mode = v;
+            }
+            else if (strcmp(key, "xvid_black") == 0) {
+                xvid_black_level = (val[0] == '1') ? XVID_BLACK_PC : XVID_BLACK_TV;
             }
             else if (strcmp(key, "show_time") == 0) {
                 show_time = (val[0] == '1') ? 1 : 0;
@@ -1093,7 +1342,7 @@ static void draw_menu(void) {
     draw_fill_rect(menu_x + 4, menu_y + 4, menu_x + menu_w - 4, menu_y + 26, col_titlebar);
 
     /* Title text - shifted right by 2 chars to align with author */
-    draw_str(menu_x + 52, menu_y + 7, "A ZERO Player v0.75", col_title);
+    draw_str(menu_x + 52, menu_y + 7, "A ZERO Player v" PLAYER_VERSION, col_title);
     draw_str(menu_x + 50, menu_y + 17, "by Grzegorz Korycki", col_value);
 
     /* Item 0: Load File */
@@ -1167,15 +1416,18 @@ static void draw_menu(void) {
         /* Show current state for items */
         if (i == 2) {  /* Color Mode */
             draw_str(menu_x + 120, item_y, color_mode_names[color_mode], col_value);
-        } else if (i == 4) {  /* Show Time */
+        } else if (i == 3) {  /* Xvid Range - output range: 0-255 (full) or 16-235 (limited) */
+            draw_str(menu_x + 110, item_y,
+                     xvid_black_level == XVID_BLACK_TV ? "[0-255]" : "[16-235]", col_value);
+        } else if (i == 5) {  /* Show Time */
             draw_str(menu_x + 150, item_y, show_time ? "[ON]" : "[OFF]", col_value);
-        } else if (i == 5) {  /* Debug Info */
+        } else if (i == 6) {  /* Debug Info */
             draw_str(menu_x + 150, item_y, show_debug ? "[ON]" : "[OFF]", col_value);
-        } else if (i == 7) {  /* Save Settings - disk icon */
+        } else if (i == 8) {  /* Save Settings - disk icon */
             draw_str(menu_x + 150, item_y, "[!]", col_value);
-        } else if (i == 8) {  /* Instructions - show arrow */
+        } else if (i == 9) {  /* Instructions - show arrow */
             draw_str(menu_x + 150, item_y, "[>]", col_value);
-        } else if (i == 9) {  /* About - yellow slash on white */
+        } else if (i == 10) {  /* About - yellow slash on white */
             draw_str(menu_x + 155, item_y, "/", 0xFFE0);  /* yellow slash */
         }
     }
@@ -1298,6 +1550,30 @@ static int check_jpeg_magic(long offset) {
     return ok;
 }
 
+/* Check if data at offset is a valid AVI chunk header (##dc or ##wb) */
+static int check_chunk_header(long offset) {
+    if (offset < 0) return 0;
+    uint8_t header[4];
+    long saved = ftell(video_file);
+    fseek(video_file, offset, SEEK_SET);
+    int ok = 0;
+    if (fread(header, 1, 4, video_file) == 4) {
+        /* Check for valid stream chunk: ##dc (video) or ##wb (audio) */
+        /* ## is stream number 00-99 */
+        if (header[0] >= '0' && header[0] <= '9' &&
+            header[1] >= '0' && header[1] <= '9') {
+            char c2 = header[2] | 0x20;  /* to lowercase */
+            char c3 = header[3] | 0x20;
+            if ((c2 == 'd' && c3 == 'c') ||  /* video */
+                (c2 == 'w' && c3 == 'b')) {  /* audio */
+                ok = 1;
+            }
+        }
+    }
+    fseek(video_file, saved, SEEK_SET);
+    return ok;
+}
+
 /* Parse idx1 index chunk - returns 1 if successful, 0 if not found */
 static int parse_idx1(long movi_data_start) {
     uint8_t tag[4];
@@ -1335,37 +1611,66 @@ static int parse_idx1(long movi_data_start) {
                 return 0;  /* No video in idx1 */
             }
 
-            /* Auto-detect offset format by checking JPEG magic */
-            /* Try different offset calculations */
+            /* Auto-detect offset format
+             * AVI idx1 offsets can be:
+             * - Relative to movi start (most common)
+             * - Absolute file offsets
+             * - Relative to movi-4 (some encoders)
+             * Offsets usually point to chunk header (##dc + size = 8 bytes)
+             */
             long offset_base = 0;
-            int add_header = 8;  /* +8 if offset points to chunk header */
+            int add_header = 8;  /* +8 to skip chunk header (fourcc + size) */
+            int format_found = 0;
 
-            /* Variant 1: relative to movi + header offset */
-            if (check_jpeg_magic(movi_data_start + first_video_offset + 8)) {
+            /* Method 1: Check chunk header (works for ALL codecs) */
+            /* Variant 1: relative to movi */
+            if (check_chunk_header(movi_data_start + first_video_offset)) {
                 offset_base = movi_data_start;
                 add_header = 8;
+                format_found = 1;
             }
-            /* Variant 2: relative to movi, no header offset */
-            else if (check_jpeg_magic(movi_data_start + first_video_offset)) {
-                offset_base = movi_data_start;
-                add_header = 0;
-            }
-            /* Variant 3: absolute + header offset */
-            else if (check_jpeg_magic(first_video_offset + 8)) {
+            /* Variant 2: absolute offset */
+            else if (check_chunk_header(first_video_offset)) {
                 offset_base = 0;
                 add_header = 8;
+                format_found = 1;
             }
-            /* Variant 4: absolute, no header offset */
-            else if (check_jpeg_magic(first_video_offset)) {
-                offset_base = 0;
-                add_header = 0;
-            }
-            /* Variant 5: relative to movi-4 (some encoders) + header */
-            else if (check_jpeg_magic(movi_data_start - 4 + first_video_offset + 8)) {
+            /* Variant 3: relative to movi-4 (some encoders) */
+            else if (check_chunk_header(movi_data_start - 4 + first_video_offset)) {
                 offset_base = movi_data_start - 4;
                 add_header = 8;
+                format_found = 1;
             }
-            else {
+
+            /* Method 2: JPEG magic for MJPEG files (backup) */
+            if (!format_found) {
+                /* Variant 4: JPEG at movi + offset + 8 */
+                if (check_jpeg_magic(movi_data_start + first_video_offset + 8)) {
+                    offset_base = movi_data_start;
+                    add_header = 8;
+                    format_found = 1;
+                }
+                /* Variant 5: JPEG at movi + offset (no header) */
+                else if (check_jpeg_magic(movi_data_start + first_video_offset)) {
+                    offset_base = movi_data_start;
+                    add_header = 0;
+                    format_found = 1;
+                }
+                /* Variant 6: JPEG at absolute + 8 */
+                else if (check_jpeg_magic(first_video_offset + 8)) {
+                    offset_base = 0;
+                    add_header = 8;
+                    format_found = 1;
+                }
+                /* Variant 7: JPEG at absolute (no header) */
+                else if (check_jpeg_magic(first_video_offset)) {
+                    offset_base = 0;
+                    add_header = 0;
+                    format_found = 1;
+                }
+            }
+
+            if (!format_found) {
                 /* None worked - fall back to scan */
                 fseek(video_file, idx_start, SEEK_SET);
                 return 0;
@@ -1450,7 +1755,6 @@ static int parse_avi(void) {
     long hdrl_end, strl_end;
     long movi_start = 0, movi_end = 0;
     uint8_t buf[64];
-    int in_audio_strl = 0;
     int found_idx1 = 0;
 
     if (!check4(video_file, "RIFF")) return 0;
@@ -1464,6 +1768,18 @@ static int parse_avi(void) {
     us_per_frame = 33333;
     repeat_count = 1;
     has_audio = 0;
+    audio_format = 0;
+    adpcm_block_align = 0;
+    adpcm_samples_per_block = 0;
+
+    /* Reset video codec detection */
+    video_codec_type = CODEC_TYPE_UNKNOWN;
+    video_fourcc[0] = 0;
+    mpeg4_extradata_size = 0;
+    mpeg4_extradata_sent = 0;
+    debug_strf_size = 0;
+    debug_first_frame_saved = 0;
+    memset(debug_first_frame, 0, sizeof(debug_first_frame));
 
     while (fread(tag, 1, 4, video_file) == 4) {
         if (read32(video_file, &chunk_size) != 0) break;
@@ -1495,7 +1811,7 @@ static int parse_avi(void) {
                         if (fread(buf, 1, 4, video_file) != 4) break;
                         if (buf[0]=='s' && buf[1]=='t' && buf[2]=='r' && buf[3]=='l') {
                             strl_end = ftell(video_file) + hsize - 4;
-                            in_audio_strl = 0;
+                            int strl_type = 0;  /* 0=unknown, 1=video, 2=audio */
                             while (ftell(video_file) < strl_end) {
                                 if (fread(htag, 1, 4, video_file) != 4) break;
                                 uint32_t shsize;
@@ -1504,25 +1820,107 @@ static int parse_avi(void) {
                                 if (htag[0]=='s' && htag[1]=='t' && htag[2]=='r' && htag[3]=='h') {
                                     if (shsize >= 8 && fread(buf, 1, (shsize < 64 ? shsize : 64), video_file) >= 8) {
                                         if (buf[0]=='a' && buf[1]=='u' && buf[2]=='d' && buf[3]=='s') {
-                                            in_audio_strl = 1;
+                                            strl_type = 2;  /* audio */
+                                        }
+                                        else if (buf[0]=='v' && buf[1]=='i' && buf[2]=='d' && buf[3]=='s') {
+                                            strl_type = 1;  /* video */
+                                            /* strh bytes 4-7 = fccHandler (codec fourcc) */
+                                            video_fourcc[0] = buf[4];
+                                            video_fourcc[1] = buf[5];
+                                            video_fourcc[2] = buf[6];
+                                            video_fourcc[3] = buf[7];
+                                            video_fourcc[4] = 0;
                                         }
                                         if (shsize > 64) fseek(video_file, shsize - 64, SEEK_CUR);
                                     } else fseek(video_file, shsize, SEEK_CUR);
                                 }
                                 else if (htag[0]=='s' && htag[1]=='t' && htag[2]=='r' && htag[3]=='f') {
-                                    if (in_audio_strl && shsize >= 16) {
-                                        if (fread(buf, 1, 16, video_file) == 16) {
+                                    if (strl_type == 2 && shsize >= 16) {
+                                        /* Audio format (WAVEFORMATEX) */
+                                        if (fread(buf, 1, (shsize < 64 ? shsize : 64), video_file) >= 16) {
                                             uint16_t fmt = read_u16_le(buf);
                                             audio_channels = read_u16_le(buf + 2);
                                             audio_sample_rate = read_u32_le(buf + 4);
+                                            adpcm_block_align = read_u16_le(buf + 12);
                                             audio_bits = read_u16_le(buf + 14);
+
                                             if (fmt == 1 && audio_channels > 0 && audio_sample_rate > 0) {
+                                                /* PCM audio */
                                                 has_audio = 1;
+                                                audio_format = AUDIO_FMT_PCM;
                                                 audio_bytes_per_sample = (audio_bits / 8) * audio_channels;
                                             }
-                                            if (shsize > 16) fseek(video_file, shsize - 16, SEEK_CUR);
+                                            else if (fmt == 2 && audio_channels > 0 && audio_sample_rate > 0) {
+                                                /* MS ADPCM audio */
+                                                has_audio = 1;
+                                                audio_format = AUDIO_FMT_ADPCM;
+                                                audio_bytes_per_sample = 2 * audio_channels;  /* Output is 16-bit PCM */
+                                                /* Read samples per block from extra data */
+                                                if (shsize >= 20) {
+                                                    adpcm_samples_per_block = read_u16_le(buf + 18);
+                                                } else {
+                                                    /* Estimate samples per block */
+                                                    int header = (audio_channels == 1) ? 7 : 14;
+                                                    adpcm_samples_per_block = 2 + (adpcm_block_align - header) * 2 / audio_channels;
+                                                }
+                                            }
+                                            else if (fmt == 0x55 && audio_channels > 0 && audio_sample_rate > 0) {
+                                                /* MP3 audio (MPEG Layer III = 0x55) */
+                                                has_audio = 1;
+                                                audio_format = AUDIO_FMT_MP3;
+                                                /* Decoder always outputs stereo 16-bit (4 bytes per sample) */
+                                                audio_bytes_per_sample = 4;
+                                            }
+                                            /* TEMPORARY: Block 44kHz audio (sync issues) */
+                                            if (audio_sample_rate >= 44000) {
+                                                has_audio = 0;
+                                                audio_format = 0;
+                                            }
+                                            if (shsize > 64) fseek(video_file, shsize - 64, SEEK_CUR);
                                         }
-                                    } else fseek(video_file, shsize, SEEK_CUR);
+                                    }
+                                    else if (strl_type == 1 && shsize >= 40) {
+                                        /* Video format (BITMAPINFOHEADER = 40 bytes) */
+                                        debug_strf_size = shsize;  /* Save for debug */
+                                        if (fread(buf, 1, 40, video_file) == 40) {
+                                            /* biWidth at offset 4, biHeight at offset 8 */
+                                            xvid_width = read_u32_le(buf + 4);
+                                            xvid_height = read_u32_le(buf + 8);
+                                            /* biCompression at offset 16 is fourcc */
+                                            if (video_fourcc[0] == 0 || video_fourcc[0] == ' ') {
+                                                video_fourcc[0] = buf[16];
+                                                video_fourcc[1] = buf[17];
+                                                video_fourcc[2] = buf[18];
+                                                video_fourcc[3] = buf[19];
+                                                video_fourcc[4] = 0;
+                                            }
+                                            /* MPEG-4 extradata: bytes after BITMAPINFOHEADER (VOL header!) */
+                                            int extradata_len = shsize - 40;
+                                            if (extradata_len > 0 && extradata_len <= MAX_EXTRADATA_SIZE) {
+                                                if (fread(mpeg4_extradata, 1, extradata_len, video_file) == (size_t)extradata_len) {
+                                                    mpeg4_extradata_size = extradata_len;
+                                                }
+                                            } else if (extradata_len > MAX_EXTRADATA_SIZE) {
+                                                fseek(video_file, extradata_len, SEEK_CUR);
+                                            }
+                                        }
+                                    }
+                                    else if (strl_type == 1 && shsize >= 20) {
+                                        /* Shorter BITMAPINFOHEADER (no extradata) */
+                                        if (fread(buf, 1, 20, video_file) == 20) {
+                                            xvid_width = read_u32_le(buf + 4);
+                                            xvid_height = read_u32_le(buf + 8);
+                                            if (video_fourcc[0] == 0 || video_fourcc[0] == ' ') {
+                                                video_fourcc[0] = buf[16];
+                                                video_fourcc[1] = buf[17];
+                                                video_fourcc[2] = buf[18];
+                                                video_fourcc[3] = buf[19];
+                                                video_fourcc[4] = 0;
+                                            }
+                                            if (shsize > 20) fseek(video_file, shsize - 20, SEEK_CUR);
+                                        }
+                                    }
+                                    else fseek(video_file, shsize, SEEK_CUR);
                                 }
                                 else fseek(video_file, shsize + (shsize & 1), SEEK_CUR);
                             }
@@ -1552,6 +1950,46 @@ static int parse_avi(void) {
         }
         else fseek(video_file, chunk_size + (chunk_size & 1), SEEK_CUR);
     }
+
+    /* Classify video codec based on fourcc */
+    if (video_fourcc[0]) {
+        /* Uppercase fourcc for comparison */
+        char fc[5];
+        for (int i = 0; i < 4; i++) {
+            fc[i] = video_fourcc[i];
+            if (fc[i] >= 'a' && fc[i] <= 'z') fc[i] -= 32;
+        }
+        fc[4] = 0;
+
+        /* Check for MJPEG variants */
+        if ((fc[0]=='M' && fc[1]=='J' && fc[2]=='P' && fc[3]=='G') ||
+            (fc[0]=='J' && fc[1]=='P' && fc[2]=='E' && fc[3]=='G') ||
+            (fc[0]=='A' && fc[1]=='V' && fc[2]=='R' && fc[3]=='N') ||
+            (fc[0]=='D' && fc[1]=='M' && fc[2]=='B' && fc[3]=='1') ||
+            (fc[0]=='M' && fc[1]=='J' && fc[2]=='L' && fc[3]=='S')) {
+            video_codec_type = CODEC_TYPE_MJPEG;
+        }
+        /* Check for MPEG-4 Part 2 variants (XviD, DivX, etc.) */
+        else if ((fc[0]=='X' && fc[1]=='V' && fc[2]=='I' && fc[3]=='D') ||
+                 (fc[0]=='D' && fc[1]=='I' && fc[2]=='V' && fc[3]=='X') ||
+                 (fc[0]=='D' && fc[1]=='X' && fc[2]=='5' && fc[3]=='0') ||
+                 (fc[0]=='F' && fc[1]=='M' && fc[2]=='P' && fc[3]=='4') ||
+                 (fc[0]=='M' && fc[1]=='P' && fc[2]=='4' && fc[3]=='V') ||
+                 (fc[0]=='M' && fc[1]=='P' && fc[2]=='4' && fc[3]=='S') ||
+                 (fc[0]=='M' && fc[1]=='4' && fc[2]=='S' && fc[3]=='2') ||
+                 (fc[0]=='3' && fc[1]=='I' && fc[2]=='V' && fc[3]=='2') ||
+                 (fc[0]=='B' && fc[1]=='L' && fc[2]=='Z' && fc[3]=='0')) {
+            video_codec_type = CODEC_TYPE_MPEG4;
+        }
+        else {
+            /* Unknown codec - default to MJPEG and hope for the best */
+            video_codec_type = CODEC_TYPE_MJPEG;
+        }
+    } else {
+        /* No fourcc found - assume MJPEG */
+        video_codec_type = CODEC_TYPE_MJPEG;
+    }
+
     return (total_frames > 0);
 }
 
@@ -1683,6 +2121,379 @@ static void calculate_scaling(int width, int height) {
     if (offset_y < 0) offset_y = 0;
 }
 
+/* ========== MPEG-4 Xvid Support ========== */
+
+/* YUV420P to RGB565 conversion with optional scaling
+ * Uses lookup tables for speed (no per-pixel multiplication!)
+ * BT.601 coefficients, supports TV (16-235) and PC (0-255) range */
+static void yuv420p_to_rgb565(uint8_t *y_plane, uint8_t *u_plane, uint8_t *v_plane,
+                               int y_stride, int uv_stride, int width, int height) {
+    /* Ensure YUV tables are initialized */
+    if (!yuv_tables_initialized) init_yuv_tables();
+
+    /* Get pointer to the Y table we need (TV or PC range) */
+    const int16_t *y_table = yuv_y_table[xvid_black_level];
+
+    /* Calculate scaling/centering for this frame */
+    if (width != video_width || height != video_height) {
+        calculate_scaling(width, height);
+        memset(framebuffer, 0, sizeof(framebuffer));
+    }
+
+    for (int j = 0; j < height && (offset_y + j * scale_factor) < SCREEN_HEIGHT; j++) {
+        uint8_t *y_row = y_plane + j * y_stride;
+        uint8_t *u_row = u_plane + (j >> 1) * uv_stride;
+        uint8_t *v_row = v_plane + (j >> 1) * uv_stride;
+
+        for (int i = 0; i < width && (offset_x + i * scale_factor) < SCREEN_WIDTH; i++) {
+            /* Fast lookup-based YUV to RGB conversion */
+            int y_idx = y_row[i];
+            int u_idx = u_row[i >> 1];
+            int v_idx = v_row[i >> 1];
+
+            int y = y_table[y_idx];  /* Y with TV/PC range correction */
+            int r = y + yuv_rv_table[v_idx];
+            int g = y + yuv_gu_table[u_idx] + yuv_gv_table[v_idx];
+            int b = y + yuv_bu_table[u_idx];
+
+            /* Clamp to 0-255 */
+            if (r < 0) r = 0; else if (r > 255) r = 255;
+            if (g < 0) g = 0; else if (g > 255) g = 255;
+            if (b < 0) b = 0; else if (b > 255) b = 255;
+
+            /* Apply dithering BEFORE converting to RGB565 (on 8-bit values) */
+            if (color_mode == COLOR_MODE_DITHERED ||
+                color_mode == COLOR_MODE_DITHER2 ||
+                color_mode == COLOR_MODE_NIGHT_DITHER ||
+                color_mode == COLOR_MODE_NIGHT_DITHER2) {
+                /* Get dither value from Bayer matrix */
+                int dither = bayer4x4[j & 3][i & 3];
+                int skip_black = (color_mode == COLOR_MODE_DITHERED ||
+                                  color_mode == COLOR_MODE_NIGHT_DITHER);
+
+                /* For night modes, dim first */
+                if (color_mode == COLOR_MODE_NIGHT_DITHER ||
+                    color_mode == COLOR_MODE_NIGHT_DITHER2) {
+                    /* Night dimming: ~27% brightness with warm tint */
+                    r = (r * 31) / 100;  /* 27% * 115% warm boost */
+                    g = (g * 19) / 100;  /* 27% * 70% */
+                    b = (b * 16) / 100;  /* 27% * 60% */
+                }
+
+                /* Apply dithering (skip for pure black if not Dither2) */
+                if (!skip_black || (r != 0 || g != 0 || b != 0)) {
+                    /* Scale dither for 8-bit: bayer is -8 to +7, scale up */
+                    r = r + dither;
+                    g = g + dither;
+                    b = b + dither;
+                    if (r < 0) r = 0; else if (r > 255) r = 255;
+                    if (g < 0) g = 0; else if (g > 255) g = 255;
+                    if (b < 0) b = 0; else if (b > 255) b = 255;
+                }
+            }
+            /* Apply warm/night color adjustments (non-dither modes) */
+            else if (color_mode == COLOR_MODE_WARM) {
+                r = (r * 115) / 100; if (r > 255) r = 255;
+                g = (g * 80) / 100;
+                b = (b * 60) / 100;
+            }
+            else if (color_mode == COLOR_MODE_WARM_PLUS) {
+                r = (r * 130) / 100; if (r > 255) r = 255;
+                g = (g * 60) / 100;
+                b = (b * 35) / 100;
+            }
+            else if (color_mode == COLOR_MODE_NIGHT) {
+                r = (r * 73) / 100;  /* 63% * 115% */
+                g = (g * 50) / 100;  /* 63% * 80% */
+                b = (b * 38) / 100;  /* 63% * 60% */
+            }
+            else if (color_mode == COLOR_MODE_NIGHT_PLUS) {
+                r = (r * 31) / 100;  /* 27% * 115% */
+                g = (g * 19) / 100;  /* 27% * 70% */
+                b = (b * 16) / 100;  /* 27% * 60% */
+            }
+            /* Gamma modes - apply on 8-bit for better precision */
+            else if (color_mode == COLOR_MODE_LIFTED16) {
+                r = 16 + (r * 239) / 255;
+                g = 16 + (g * 239) / 255;
+                b = 16 + (b * 239) / 255;
+            }
+            else if (color_mode == COLOR_MODE_LIFTED32) {
+                r = 32 + (r * 223) / 255;
+                g = 32 + (g * 223) / 255;
+                b = 32 + (b * 223) / 255;
+            }
+
+            /* Convert to RGB565 */
+            uint16_t pixel = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+
+            /* Output with scaling */
+            for (int sy = 0; sy < scale_factor; sy++) {
+                for (int sx = 0; sx < scale_factor; sx++) {
+                    int dst_x = offset_x + i * scale_factor + sx;
+                    int dst_y = offset_y + j * scale_factor + sy;
+                    if (dst_x < SCREEN_WIDTH && dst_y < SCREEN_HEIGHT) {
+                        framebuffer[dst_y * SCREEN_WIDTH + dst_x] = pixel;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* Debug: fill top of screen with color to show init progress AND display it */
+static void debug_init_progress(uint16_t color, int step) {
+    /* Fill a horizontal bar at top showing progress */
+    int bar_width = (step * 32);  /* Each step = 32 pixels wide */
+    if (bar_width > 320) bar_width = 320;
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < bar_width; x++) {
+            framebuffer[y * 320 + x] = color;
+        }
+    }
+    /* Force display update so we can see progress even if we hang */
+    if (video_cb) {
+        video_cb(framebuffer, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * sizeof(pixel_t));
+    }
+}
+
+/* Initialize Xvid MPEG-4 decoder */
+static int init_xvid_mpeg4(void) {
+    if (xvid_initialized) return 1;
+
+    /* Step 1: Blue bar - starting init */
+    debug_init_progress(0x001F, 1);
+
+    /* Initialize Xvid global - required once */
+    xvid_gbl_init_t xinit;
+    memset(&xinit, 0, sizeof(xinit));
+    xinit.version = XVID_VERSION;
+    xinit.cpu_flags = 0;  /* Auto-detect disabled, use C code */
+
+    int ret = xvid_global(NULL, XVID_GBL_INIT, &xinit, NULL);
+    if (ret < 0) {
+        debug_init_progress(0xF800, 10); /* Red = init failed */
+        return 0;
+    }
+
+    /* Step 2: Green bar - global init done */
+    debug_init_progress(0x07E0, 2);
+
+    /* Create decoder instance */
+    xvid_dec_create_t xcreate;
+    memset(&xcreate, 0, sizeof(xcreate));
+    xcreate.version = XVID_VERSION;
+    xcreate.width = xvid_width > 0 ? xvid_width : 320;
+    xcreate.height = xvid_height > 0 ? xvid_height : 240;
+
+    ret = xvid_decore(NULL, XVID_DEC_CREATE, &xcreate, NULL);
+    if (ret < 0) {
+        debug_init_progress(0xF800, 10); /* Red = create failed */
+        return 0;
+    }
+    xvid_handle = xcreate.handle;
+
+    /* Step 3: Cyan bar - decoder created */
+    debug_init_progress(0x07FF, 3);
+
+    /* Allocate YUV buffer for decoder output */
+    int w = xvid_width > 0 ? xvid_width : 320;
+    int h = xvid_height > 0 ? xvid_height : 240;
+    int y_size = w * h;
+    int uv_size = (w / 2) * (h / 2);
+
+    yuv_buffer = (uint8_t *)malloc(y_size + 2 * uv_size);
+    if (!yuv_buffer) {
+        xvid_decore(xvid_handle, XVID_DEC_DESTROY, NULL, NULL);
+        xvid_handle = NULL;
+        debug_init_progress(0xF800, 10); /* Red = alloc failed */
+        return 0;
+    }
+    /* Clear buffer to avoid garbage if decode fails */
+    memset(yuv_buffer, 0, y_size + 2 * uv_size);
+    yuv_y = yuv_buffer;
+    yuv_u = yuv_buffer + y_size;
+    yuv_v = yuv_buffer + y_size + uv_size;
+
+    /* Step 4: Full green bar - ALL DONE! */
+    debug_init_progress(0x07E0, 10);
+
+    xvid_initialized = 1;
+    return 1;
+}
+
+/* Close Xvid decoder */
+static void close_xvid(void) {
+    if (xvid_handle) {
+        xvid_decore(xvid_handle, XVID_DEC_DESTROY, NULL, NULL);
+        xvid_handle = NULL;
+    }
+    if (yuv_buffer) {
+        free(yuv_buffer);
+        yuv_buffer = NULL;
+        yuv_y = NULL;
+        yuv_u = NULL;
+        yuv_v = NULL;
+    }
+    xvid_initialized = 0;
+}
+
+/* Debug: fill screen with solid color */
+static void debug_fill_screen(uint16_t color) {
+    for (int i = 0; i < FRAME_PIXELS; i++) {
+        framebuffer[i] = color;
+    }
+}
+
+/* Debug: display hex bytes at top of screen */
+static void debug_show_hex(uint8_t *data, int size, int type, int ret) {
+    static const char hextab[] = "0123456789ABCDEF";
+    char hex[64];
+    int len = size > 8 ? 8 : size;
+    char *p = hex;
+    for (int i = 0; i < len; i++) {
+        *p++ = hextab[(data[i] >> 4) & 0xF];
+        *p++ = hextab[data[i] & 0xF];
+        *p++ = ' ';
+    }
+    *p = 0;
+    /* Clear top 3 lines */
+    for (int i = 0; i < 320 * 30; i++) framebuffer[i] = 0;
+    /* Line 1: Frame data */
+    draw_str(4, 2, hex, 0xFFFF);
+    /* Show type and ret */
+    char info[32];
+    info[0] = 't'; info[1] = '=';
+    info[2] = (type < 0) ? '-' : '0' + type;
+    info[3] = ' '; info[4] = 'r'; info[5] = '=';
+    info[6] = (ret < 0) ? '-' : '0' + (ret > 9 ? 9 : ret);
+    info[7] = 0;
+    draw_str(220, 2, info, 0x07E0);
+    /* Line 2: Extradata info + strf size */
+    char ext[64];
+    p = ext;
+    *p++ = 'E'; *p++ = ':';
+    /* Show extradata_size as decimal */
+    int es = mpeg4_extradata_size;
+    if (es >= 100) { *p++ = '0' + (es / 100); es %= 100; }
+    if (mpeg4_extradata_size >= 10) { *p++ = '0' + (es / 10); es %= 10; }
+    *p++ = '0' + es;
+    *p++ = ' ';
+    *p++ = 'S'; *p++ = ':';
+    /* Show strf size as decimal */
+    int ss = debug_strf_size;
+    if (ss >= 100) { *p++ = '0' + (ss / 100); ss %= 100; }
+    if (debug_strf_size >= 10) { *p++ = '0' + (ss / 10); ss %= 10; }
+    *p++ = '0' + ss;
+    *p = 0;
+    draw_str(4, 12, ext, 0xF81F);  /* Magenta */
+    /* ADPCM debug moved to show_debug panel (line y=32) which draws after video */
+}
+
+/* Decode MPEG-4 frame using Xvid */
+static int decode_mpeg4_frame(uint8_t *data, int size) {
+    /* Save first 20 bytes for debug (only first frame) */
+    if (!debug_first_frame_saved && size >= 20) {
+        memcpy(debug_first_frame, data, 20);
+        debug_first_frame_saved = 1;
+    }
+
+    if (!xvid_initialized) {
+        if (!init_xvid_mpeg4()) {
+            /* Red screen = Xvid init failed */
+            debug_fill_screen(0xF800);
+            return 0;
+        }
+    }
+
+    /* Send extradata (VOL header) to decoder before first frame */
+    if (!mpeg4_extradata_sent && mpeg4_extradata_size > 0) {
+        xvid_dec_frame_t xvol;
+        xvid_dec_stats_t svol;
+        memset(&xvol, 0, sizeof(xvol));
+        memset(&svol, 0, sizeof(svol));
+        xvol.version = XVID_VERSION;
+        svol.version = XVID_VERSION;
+        xvol.bitstream = mpeg4_extradata;
+        xvol.length = mpeg4_extradata_size;
+        xvol.output.csp = XVID_CSP_NULL;  /* Don't output, just parse VOL */
+        xvid_decore(xvid_handle, XVID_DEC_DECODE, &xvol, &svol);
+        mpeg4_extradata_sent = 1;
+    }
+
+    /* Set up decode frame parameters */
+    xvid_dec_frame_t xframe;
+    xvid_dec_stats_t xstats;
+
+    int w = xvid_width > 0 ? xvid_width : 320;
+    int h = xvid_height > 0 ? xvid_height : 240;
+
+    uint8_t *bitstream = data;
+    int remaining = size;
+    int ret = 0;
+    int loops = 0;
+
+    /* Loop to consume VOS/VO/VOL headers until we get actual frame data */
+    do {
+        memset(&xframe, 0, sizeof(xframe));
+        memset(&xstats, 0, sizeof(xstats));
+
+        xframe.version = XVID_VERSION;
+        xstats.version = XVID_VERSION;
+
+        xframe.bitstream = bitstream;
+        xframe.length = remaining;
+
+        /* Output to our YUV buffer - use PLANAR which respects separate plane pointers */
+        xframe.output.csp = XVID_CSP_PLANAR;
+        xframe.output.plane[0] = yuv_y;
+        xframe.output.plane[1] = yuv_u;
+        xframe.output.plane[2] = yuv_v;
+        xframe.output.stride[0] = w;
+        xframe.output.stride[1] = w / 2;
+        xframe.output.stride[2] = w / 2;
+
+        /* Decode! */
+        ret = xvid_decore(xvid_handle, XVID_DEC_DECODE, &xframe, &xstats);
+
+        /* If VOL decoded, update dimensions */
+        if (xstats.type == XVID_TYPE_VOL) {
+            if (xstats.data.vol.width > 0) xvid_width = xstats.data.vol.width;
+            if (xstats.data.vol.height > 0) xvid_height = xstats.data.vol.height;
+            w = xvid_width;
+            h = xvid_height;
+        }
+
+        /* Advance bitstream pointer for next iteration */
+        if (ret > 0) {
+            bitstream += ret;
+            remaining -= ret;
+        }
+
+        loops++;
+    } while (xstats.type <= 0 && ret > 0 && remaining > 4 && loops < 10);
+
+    /* DEBUG: Show first 8 bytes + type + ret + loops at top of screen */
+    debug_show_hex(data, size, xstats.type, ret);
+
+    if (ret < 0) {
+        /* Orange screen = decode error */
+        debug_fill_screen(0xFD20);
+        return 0;
+    }
+
+    /* Check if we got a frame */
+    if (xstats.type <= 0) {
+        /* No frame decoded yet (maybe needs more data) */
+        return 1;  /* Return success to avoid breaking playback */
+    }
+
+    /* Convert YUV420P to RGB565 and write to framebuffer */
+    yuv420p_to_rgb565(yuv_y, yuv_u, yuv_v, w, w / 2, w, h);
+
+    return 1;
+}
+
 /* Decode frame at index directly into framebuffer, return success */
 static int decode_single_frame(int idx) {
     if (!video_file || idx >= total_frames) return 0;
@@ -1696,6 +2507,17 @@ static int decode_single_frame(int idx) {
     if (fseek(video_file, offset, SEEK_SET) != 0) return 0;
     if (fread(jpeg_buffer, 1, size, video_file) != size) return 0;
 
+    /* Branch based on video codec type */
+    if (video_codec_type == CODEC_TYPE_MPEG4) {
+        /* Decode MPEG-4 using Xvid */
+        int result = decode_mpeg4_frame(jpeg_buffer, size);
+        if (result) {
+            decode_counter++;
+        }
+        return result;
+    }
+
+    /* Default: MJPEG decoding via TJpgDec */
     if (jpeg_buffer[0] != 0xFF || jpeg_buffer[1] != 0xD8) return 0;
 
     /* Find/add EOI marker */
@@ -1733,6 +2555,7 @@ static int decode_single_frame(int idx) {
 
 /* Forward declaration */
 static void refill_audio_ring(void);
+static void mp3_reset(void);
 
 /* Seek to specific frame */
 static void seek_to_frame(int target_frame) {
@@ -1745,36 +2568,92 @@ static void seek_to_frame(int target_frame) {
 
     /* Estimate audio position based on time */
     if (has_audio && audio_bytes_per_sample > 0) {
-        uint64_t time_samples = (uint64_t)target_frame * audio_sample_rate / clip_fps;
-        uint64_t target_bytes = time_samples * audio_bytes_per_sample;
+        /* For MP3: use detected sample rate if different from AVI header */
+        int effective_rate = audio_sample_rate;
+        if (audio_format == AUDIO_FMT_MP3 && mp3_detected_samplerate > 0) {
+            effective_rate = mp3_detected_samplerate;
+        }
+        uint64_t time_samples = (uint64_t)target_frame * effective_rate / clip_fps;
 
-        /* Find which audio chunk contains this position */
-        uint64_t bytes_so_far = 0;
+        /* Calculate audio chunk position */
         audio_chunk_idx = 0;
         audio_chunk_pos = 0;
 
-        while (audio_chunk_idx < total_audio_chunks) {
-            if (bytes_so_far + audio_sizes[audio_chunk_idx] > target_bytes) {
-                audio_chunk_pos = target_bytes - bytes_so_far;
-                break;
+        if (audio_format == AUDIO_FMT_MP3) {
+            /* MP3: each AVI chunk = one MP3 frame = fixed samples
+             * MPEG-1 Layer III (>=32kHz): 1152 samples/frame
+             * MPEG-2 Layer III (<32kHz):  576 samples/frame
+             */
+            int samples_per_mp3_frame = (effective_rate >= 32000) ? 1152 : 576;
+            audio_chunk_idx = time_samples / samples_per_mp3_frame;
+            if (audio_chunk_idx >= total_audio_chunks) {
+                audio_chunk_idx = total_audio_chunks - 1;
             }
-            bytes_so_far += audio_sizes[audio_chunk_idx];
-            audio_chunk_idx++;
+            audio_chunk_pos = 0;
+            /* Align audio_samples_sent to chunk boundary */
+            time_samples = (uint64_t)audio_chunk_idx * samples_per_mp3_frame;
+        } else if (audio_format == AUDIO_FMT_ADPCM && adpcm_samples_per_block > 0 && adpcm_block_align > 0) {
+            /* ADPCM: calculate compressed bytes then find chunk */
+            uint64_t target_blocks = time_samples / adpcm_samples_per_block;
+            uint64_t target_bytes = target_blocks * adpcm_block_align;
+            uint64_t bytes_so_far = 0;
+
+            while (audio_chunk_idx < total_audio_chunks) {
+                if (bytes_so_far + audio_sizes[audio_chunk_idx] > target_bytes) {
+                    uint32_t pos_in_chunk = target_bytes - bytes_so_far;
+                    pos_in_chunk = (pos_in_chunk / adpcm_block_align) * adpcm_block_align;
+                    audio_chunk_pos = pos_in_chunk;
+                    break;
+                }
+                bytes_so_far += audio_sizes[audio_chunk_idx];
+                audio_chunk_idx++;
+            }
+        } else {
+            /* PCM: samples * bytes_per_sample = file position */
+            uint64_t target_bytes = time_samples * audio_bytes_per_sample;
+            uint64_t bytes_so_far = 0;
+
+            while (audio_chunk_idx < total_audio_chunks) {
+                if (bytes_so_far + audio_sizes[audio_chunk_idx] > target_bytes) {
+                    audio_chunk_pos = target_bytes - bytes_so_far;
+                    break;
+                }
+                bytes_so_far += audio_sizes[audio_chunk_idx];
+                audio_chunk_idx++;
+            }
         }
 
         audio_samples_sent = time_samples;
         aring_read = 0;
         aring_write = 0;
         aring_count = 0;
-        refill_audio_ring();
+
+        /* Debug: log seek values */
+        if (audio_format == AUDIO_FMT_MP3) {
+            int spf = (effective_rate >= 32000) ? 1152 : 576;
+            xlog("SEEK MP3: vfr=%d chunk=%d/%d spf=%d sent=%llu\n",
+                 target_frame, audio_chunk_idx, total_audio_chunks, spf,
+                 (unsigned long long)audio_samples_sent);
+        } else if (audio_format == AUDIO_FMT_ADPCM) {
+            xlog("SEEK ADPCM: frame=%d chunk=%d/%d pos=%u blk=%d\n",
+                 target_frame, audio_chunk_idx, total_audio_chunks, audio_chunk_pos, adpcm_block_align);
+        }
+
+        /* For MP3: skip refill during seek (decoder is experimental and may hang) */
+        if (audio_format == AUDIO_FMT_MP3) {
+            mp3_reset();
+            /* Don't call refill_audio_ring() - let normal playback handle it */
+        } else {
+            refill_audio_ring();
+        }
     }
 
     /* Decode the target frame immediately */
     decode_single_frame(target_frame);
 }
 
-/* Audio: read from disk into ring buffer */
-static int read_audio_disk(uint8_t *buf, int bytes_needed) {
+/* Audio: read raw PCM from disk into ring buffer */
+static int read_audio_disk_pcm(uint8_t *buf, int bytes_needed) {
     int bytes_read = 0;
     while (bytes_read < bytes_needed && audio_chunk_idx < total_audio_chunks) {
         uint32_t chunk_size = audio_sizes[audio_chunk_idx];
@@ -1798,21 +2677,347 @@ static int read_audio_disk(uint8_t *buf, int bytes_needed) {
     return bytes_read;
 }
 
+/* ADPCM block read buffer */
+static uint8_t adpcm_read_buf[8192];  /* Large enough for any ADPCM block size */
+
+/* Read and decode ADPCM, write decoded PCM to ring buffer */
+static int read_audio_disk_adpcm(void) {
+    if (adpcm_block_align <= 0 || audio_chunk_idx >= total_audio_chunks) return 0;
+
+    int total_decoded_bytes = 0;
+    int free_space = AUDIO_RING_SIZE - aring_count;
+    int loop_count = 0;
+    int skip_count = 0;
+    static int adpcm_call_count = 0;
+    adpcm_call_count++;
+
+    xlog("ADPCM START: call=%d chunk=%d/%d pos=%u free=%d blk=%d\n",
+         adpcm_call_count, audio_chunk_idx, total_audio_chunks, audio_chunk_pos, free_space, adpcm_block_align);
+
+    while (free_space > 512 && audio_chunk_idx < total_audio_chunks && loop_count < 500) {
+        loop_count++;
+        /* Read one ADPCM block */
+        uint32_t chunk_size = audio_sizes[audio_chunk_idx];
+        uint32_t remaining = chunk_size - audio_chunk_pos;
+
+        int block_size = adpcm_block_align;
+        if (block_size > (int)remaining) block_size = remaining;
+        if (block_size > (int)sizeof(adpcm_read_buf)) block_size = sizeof(adpcm_read_buf);
+        if (block_size < 7) {
+            /* Skip to next chunk */
+            skip_count++;
+            audio_chunk_idx++;
+            audio_chunk_pos = 0;
+            if (skip_count > 100) {
+                xlog("ADPCM SKIP LOOP: skips=%d chunk=%d\n", skip_count, audio_chunk_idx);
+                break;
+            }
+            continue;
+        }
+
+        uint32_t file_pos = audio_offsets[audio_chunk_idx] + audio_chunk_pos;
+        xlog("ADPCM LOOP %d: fseek pos=%u blk=%d\n", loop_count, file_pos, block_size);
+
+        if (fseek(video_file, file_pos, SEEK_SET) != 0) {
+            xlog("ADPCM: fseek FAILED\n");
+            break;
+        }
+
+        xlog("ADPCM LOOP %d: fread start\n", loop_count);
+        size_t got = fread(adpcm_read_buf, 1, block_size, video_file);
+        xlog("ADPCM LOOP %d: fread got=%zu\n", loop_count, got);
+        if (got < 7) break;
+
+        audio_chunk_pos += got;
+        if (audio_chunk_pos >= chunk_size) {
+            audio_chunk_idx++;
+            audio_chunk_pos = 0;
+        }
+
+        /* Decode block */
+        xlog("ADPCM LOOP %d: decode start ch=%d\n", loop_count, audio_channels);
+        int samples;
+        if (audio_channels == 1) {
+            samples = decode_adpcm_block_mono(adpcm_read_buf, got, adpcm_decode_buf, ADPCM_DECODE_BUF_SIZE);
+        } else {
+            samples = decode_adpcm_block_stereo(adpcm_read_buf, got, adpcm_decode_buf, ADPCM_DECODE_BUF_SIZE);
+        }
+        xlog("ADPCM LOOP %d: decode done samples=%d\n", loop_count, samples);
+
+        if (samples <= 0) continue;
+
+        /* Write decoded samples to ring buffer */
+        int decoded_bytes = samples * 2;  /* 16-bit samples */
+        if (decoded_bytes > free_space) decoded_bytes = free_space;
+
+        uint8_t *src = (uint8_t *)adpcm_decode_buf;
+        int written = 0;
+        while (written < decoded_bytes) {
+            int before_wrap = AUDIO_RING_SIZE - aring_write;
+            int to_write = decoded_bytes - written;
+            if (to_write > before_wrap) to_write = before_wrap;
+
+            memcpy(audio_ring + aring_write, src + written, to_write);
+            aring_write = (aring_write + to_write) % AUDIO_RING_SIZE;
+            written += to_write;
+        }
+
+        aring_count += decoded_bytes;
+        free_space -= decoded_bytes;
+        total_decoded_bytes += decoded_bytes;
+
+        /* Limit per call to avoid blocking */
+        if (total_decoded_bytes > 4096) break;
+    }
+
+    xlog("ADPCM END: loops=%d skips=%d decoded=%d chunk=%d\n",
+         loop_count, skip_count, total_decoded_bytes, audio_chunk_idx);
+    return total_decoded_bytes;
+}
+
+/* Initialize MP3 decoder (froggyMP3 wrapper) */
+static void mp3_init(void) {
+    if (!mp3_initialized) {
+        mp3_handle = mad_init();
+        if (mp3_handle) {
+            mp3_initialized = 1;
+        }
+        mp3_input_len = 0;
+        mp3_input_remaining = 0;
+    }
+}
+
+/* Reset MP3 decoder state (for seek) */
+static void mp3_reset(void) {
+    if (mp3_initialized && mp3_handle) {
+        mad_uninit(mp3_handle);
+        mp3_handle = mad_init();
+    }
+    mp3_input_len = 0;
+    mp3_input_remaining = 0;
+}
+
+/* Read raw MP3 data from AVI chunks into input buffer */
+static int mp3_fill_input_buffer(void) {
+    mp3_debug_fill++;
+
+    /* Move remaining data to start of buffer */
+    if (mp3_input_remaining > 0 && mp3_input_remaining < mp3_input_len) {
+        memmove(mp3_input_buf, mp3_input_buf + (mp3_input_len - mp3_input_remaining), mp3_input_remaining);
+        mp3_input_len = mp3_input_remaining;
+    } else if (mp3_input_remaining <= 0) {
+        mp3_input_len = 0;
+    }
+
+    /* Fill rest of buffer from AVI audio chunks */
+    int space = MP3_INPUT_BUF_SIZE - mp3_input_len - 8; /* Leave some guard space */
+    if (space <= 0) return mp3_input_len;
+
+    while (space > 0 && audio_chunk_idx < total_audio_chunks) {
+        uint32_t chunk_size = audio_sizes[audio_chunk_idx];
+        uint32_t remaining = chunk_size - audio_chunk_pos;
+
+        if (remaining == 0) {
+            audio_chunk_idx++;
+            audio_chunk_pos = 0;
+            continue;
+        }
+
+        int to_read = (space < (int)remaining) ? space : (int)remaining;
+
+        uint32_t file_pos = audio_offsets[audio_chunk_idx] + audio_chunk_pos;
+        if (fseek(video_file, file_pos, SEEK_SET) != 0) break;
+
+        size_t got = fread(mp3_input_buf + mp3_input_len, 1, to_read, video_file);
+        if (got == 0) break;
+
+        mp3_input_len += got;
+        audio_chunk_pos += got;
+        space -= got;
+
+        if (audio_chunk_pos >= chunk_size) {
+            audio_chunk_idx++;
+            audio_chunk_pos = 0;
+        }
+    }
+
+    mp3_input_remaining = mp3_input_len;
+    return mp3_input_len;
+}
+
+/* Read and decode MP3, write decoded PCM to ring buffer (froggyMP3 API) */
+static int read_audio_disk_mp3(void) {
+    if (audio_chunk_idx >= total_audio_chunks && mp3_input_remaining <= 0) return 0;
+
+    /* Initialize decoder if needed */
+    mp3_init();
+    if (!mp3_handle) return 0;
+
+    int total_decoded_bytes = 0;
+    int free_space = AUDIO_RING_SIZE - aring_count;
+    int consecutive_errors = 0;
+
+    while (free_space > 512 && consecutive_errors < 100) {
+        /* Refill input buffer if needed */
+        if (mp3_input_remaining < 2048) {
+            if (mp3_fill_input_buffer() <= 0) break;
+        }
+
+        if (mp3_input_len <= 0) break;
+
+        /* Decode using froggyMP3 wrapper - output is stereo 16-bit PCM */
+        int bytes_read = 0;
+        int bytes_done = 0;
+        int out_buf_size = MP3_DECODE_BUF_SIZE * sizeof(int16_t);
+
+        int result = mad_decode(mp3_handle,
+                                (char *)mp3_input_buf, mp3_input_len,
+                                (char *)mp3_decode_buf, out_buf_size,
+                                &bytes_read, &bytes_done,
+                                16,   /* 16-bit resolution */
+                                0);   /* full sample rate */
+
+        /* Debug info */
+        mp3_debug_pcm_len = bytes_done / 4;  /* stereo 16-bit = 4 bytes per sample */
+        if (bytes_done > 0) {
+            mp3_debug_dec_smp = mp3_decode_buf[0];
+        }
+
+        if (result == MAD_OK) {
+            mp3_debug_frames++;
+            consecutive_errors = 0;  /* Reset on success */
+            /* Detect MP3 format on first successful decode */
+            if (mp3_detected_samplerate == 0) {
+                int sr = 0, ch = 0;
+                if (mad_get_info(mp3_handle, &sr, &ch)) {
+                    mp3_detected_samplerate = sr;
+                    mp3_detected_channels = ch;
+                    mp3_debug_pcm_ch = ch;  /* Update debug display */
+                }
+            }
+            /* Update remaining - shift consumed data */
+            mp3_input_remaining = mp3_input_len - bytes_read;
+            if (mp3_input_remaining > 0 && bytes_read > 0) {
+                memmove(mp3_input_buf, mp3_input_buf + bytes_read, mp3_input_remaining);
+            }
+            mp3_input_len = mp3_input_remaining;
+        } else if (result == MAD_NEED_MORE_INPUT) {
+            /* Need more data - refill and retry */
+            mp3_input_remaining = mp3_input_len - bytes_read;
+            if (mp3_input_remaining > 0 && bytes_read > 0) {
+                memmove(mp3_input_buf, mp3_input_buf + bytes_read, mp3_input_remaining);
+            }
+            mp3_input_len = mp3_input_remaining;
+            if (mp3_fill_input_buffer() <= 0) break;
+            continue;
+        } else if (result == MAD_ERR) {
+            /* Recoverable error - skip at least 1 byte to avoid infinite loop */
+            mp3_debug_errors++;
+            consecutive_errors++;
+            if (bytes_read == 0) bytes_read = 1;
+            mp3_input_remaining = mp3_input_len - bytes_read;
+            if (mp3_input_remaining > 0) {
+                memmove(mp3_input_buf, mp3_input_buf + bytes_read, mp3_input_remaining);
+            }
+            mp3_input_len = mp3_input_remaining;
+            continue;
+        } else {
+            /* Fatal error */
+            mp3_debug_errors++;
+            break;
+        }
+
+        if (bytes_done <= 0) continue;
+
+        /* Write decoded PCM to ring buffer
+         * mad_decode outputs mono if input is mono, stereo if stereo
+         * Ring buffer must always be stereo 16-bit for consistent playback
+         * Use detected MP3 channels (from first frame), fallback to AVI header
+         */
+        int actual_channels = (mp3_detected_channels > 0) ? mp3_detected_channels : audio_channels;
+        if (actual_channels == 1) {
+            /* Mono input: duplicate each sample to stereo */
+            int mono_samples = bytes_done / 2;  /* 16-bit mono = 2 bytes/sample */
+            int stereo_bytes = mono_samples * 4;  /* stereo = 4 bytes/sample */
+
+            mp3_debug_out_smp = mono_samples;
+
+            if (stereo_bytes > free_space) {
+                mono_samples = free_space / 4;
+                stereo_bytes = mono_samples * 4;
+            }
+
+            int16_t *mono_src = (int16_t *)mp3_decode_buf;
+            for (int i = 0; i < mono_samples; i++) {
+                int16_t sample = mono_src[i];
+                /* Write L then R (same sample duplicated) */
+                audio_ring[aring_write] = sample & 0xFF;
+                audio_ring[aring_write + 1] = (sample >> 8) & 0xFF;
+                audio_ring[aring_write + 2] = sample & 0xFF;
+                audio_ring[aring_write + 3] = (sample >> 8) & 0xFF;
+                aring_write = (aring_write + 4) % AUDIO_RING_SIZE;
+            }
+
+            aring_count += stereo_bytes;
+            free_space -= stereo_bytes;
+            total_decoded_bytes += stereo_bytes;
+            mp3_debug_bytes += stereo_bytes;
+        } else {
+            /* Stereo input: copy directly */
+            mp3_debug_out_smp = bytes_done / 4;
+
+            int decoded_bytes = bytes_done;
+            if (decoded_bytes > free_space) decoded_bytes = free_space;
+
+            uint8_t *src = (uint8_t *)mp3_decode_buf;
+            int written = 0;
+            while (written < decoded_bytes) {
+                int before_wrap = AUDIO_RING_SIZE - aring_write;
+                int to_write = decoded_bytes - written;
+                if (to_write > before_wrap) to_write = before_wrap;
+
+                memcpy(audio_ring + aring_write, src + written, to_write);
+                aring_write = (aring_write + to_write) % AUDIO_RING_SIZE;
+                written += to_write;
+            }
+
+            aring_count += decoded_bytes;
+            free_space -= decoded_bytes;
+            total_decoded_bytes += decoded_bytes;
+            mp3_debug_bytes += decoded_bytes;
+        }
+
+        /* Limit per call to avoid blocking */
+        if (total_decoded_bytes > 4096) break;
+    }
+
+    return total_decoded_bytes;
+}
+
 static void refill_audio_ring(void) {
     if (!has_audio || audio_chunk_idx >= total_audio_chunks) return;
 
-    int free_space = AUDIO_RING_SIZE - aring_count;
-    while (free_space > 0 && audio_chunk_idx < total_audio_chunks) {
-        int before_wrap = AUDIO_RING_SIZE - aring_write;
-        int to_read = (free_space < before_wrap) ? free_space : before_wrap;
-        if (to_read > 4096) to_read = 4096;
+    if (audio_format == AUDIO_FMT_ADPCM) {
+        /* ADPCM: read blocks, decode, write PCM to ring */
+        read_audio_disk_adpcm();
+    } else if (audio_format == AUDIO_FMT_MP3) {
+        /* MP3: read frames, decode with libmad, write PCM to ring */
+        read_audio_disk_mp3();
+    } else {
+        /* PCM: read directly into ring */
+        int free_space = AUDIO_RING_SIZE - aring_count;
+        while (free_space > 0 && audio_chunk_idx < total_audio_chunks) {
+            int before_wrap = AUDIO_RING_SIZE - aring_write;
+            int to_read = (free_space < before_wrap) ? free_space : before_wrap;
+            if (to_read > 4096) to_read = 4096;
 
-        int got = read_audio_disk(audio_ring + aring_write, to_read);
-        if (got <= 0) break;
+            int got = read_audio_disk_pcm(audio_ring + aring_write, to_read);
+            if (got <= 0) break;
 
-        aring_write = (aring_write + got) % AUDIO_RING_SIZE;
-        aring_count += got;
-        free_space -= got;
+            aring_write = (aring_write + got) % AUDIO_RING_SIZE;
+            aring_count += got;
+            free_space -= got;
+        }
     }
 }
 
@@ -1840,11 +3045,25 @@ static void play_audio_for_frame(void) {
     }
 
     /* Sync based on current_frame_idx (frames actually shown) */
+    /* For MP3: use detected sample rate (AVI header may be wrong) */
+    int effective_rate = audio_sample_rate;
+    if (audio_format == AUDIO_FMT_MP3 && mp3_detected_samplerate > 0) {
+        effective_rate = mp3_detected_samplerate;
+    }
     /* Add ~0.1s audio lead to compensate for video-ahead-of-audio sync issue */
-    /* At 22050Hz, 0.1s = 2205 samples. Using 2000 for round number. */
-    #define AUDIO_SYNC_OFFSET 2000
-    uint64_t expected = (uint64_t)current_frame_idx * audio_sample_rate / clip_fps + AUDIO_SYNC_OFFSET;
+    /* Offset = sample_rate / 10 (0.1 second worth of samples) */
+    int sync_offset = effective_rate / 10;
+    uint64_t expected = (uint64_t)current_frame_idx * effective_rate / clip_fps + sync_offset;
     int64_t to_send = expected - audio_samples_sent;
+
+    /* Debug log every 30 frames for MP3 */
+    static int sync_log_count = 0;
+    if (audio_format == AUDIO_FMT_MP3 && (sync_log_count++ % 30 == 0)) {
+        xlog("SYNC MP3: frm=%d rate=%d exp=%llu sent=%llu to=%lld ring=%d\n",
+             current_frame_idx, effective_rate,
+             (unsigned long long)expected, (unsigned long long)audio_samples_sent,
+             (long long)to_send, aring_count);
+    }
 
     if (to_send <= 0) return;
     if (to_send > MAX_AUDIO_BUFFER) to_send = MAX_AUDIO_BUFFER;
@@ -1860,24 +3079,34 @@ static void play_audio_for_frame(void) {
     int got_samples = got_bytes / audio_bytes_per_sample;
     if (got_samples <= 0) return;
 
+    /* Debug: capture first sample from ring buffer */
+    if (audio_format == AUDIO_FMT_MP3 && got_bytes >= 2) {
+        mp3_debug_ring_smp = ((int16_t *)temp)[0];
+    }
+
     int out = 0;
-    if (audio_channels == 1 && audio_bits == 16) {
+    /* For ADPCM and MP3, data in ring buffer is already decoded to 16-bit PCM */
+    int effective_bits = (audio_format == AUDIO_FMT_ADPCM || audio_format == AUDIO_FMT_MP3) ? 16 : audio_bits;
+    /* For MP3, ring buffer is always stereo (decoder duplicates mono) */
+    int effective_channels = (audio_format == AUDIO_FMT_MP3) ? 2 : audio_channels;
+
+    if (effective_channels == 1 && effective_bits == 16) {
         int16_t *src = (int16_t *)temp;
         for (int i = 0; i < got_samples && out < MAX_AUDIO_BUFFER; i++) {
             audio_out_buffer[out * 2] = src[i];
             audio_out_buffer[out * 2 + 1] = src[i];
             out++;
         }
-    } else if (audio_channels == 2 && audio_bits == 16) {
+    } else if (effective_channels == 2 && effective_bits == 16) {
         int16_t *src = (int16_t *)temp;
         for (int i = 0; i < got_samples && out < MAX_AUDIO_BUFFER; i++) {
             audio_out_buffer[out * 2] = src[i * 2];
             audio_out_buffer[out * 2 + 1] = src[i * 2 + 1];
             out++;
         }
-    } else if (audio_bits == 8) {
+    } else if (effective_bits == 8) {
         for (int i = 0; i < got_samples && out < MAX_AUDIO_BUFFER; i++) {
-            int16_t s = ((int16_t)temp[i * audio_channels] - 128) << 8;
+            int16_t s = ((int16_t)temp[i * effective_channels] - 128) << 8;
             audio_out_buffer[out * 2] = s;
             audio_out_buffer[out * 2 + 1] = s;
             out++;
@@ -1887,10 +3116,21 @@ static void play_audio_for_frame(void) {
     if (out > 0) {
         audio_batch_cb(audio_out_buffer, out);
         audio_samples_sent += out;
+        if (audio_format == AUDIO_FMT_MP3) {
+            mp3_debug_sent += out;
+            mp3_debug_ring = aring_count;
+            mp3_debug_sample = audio_out_buffer[0];  /* Capture first sample */
+        }
     }
 }
 
 static int open_video(const char *path) {
+    /* Close Xvid decoder from previous file if any */
+    close_xvid();
+
+    /* Reset MPEG-4 error message flag */
+    mpeg4_error_shown = 0;
+
     if (video_file) fclose(video_file);
     video_file = fopen(path, "rb");
     if (!video_file) return 0;
@@ -1906,6 +3146,12 @@ static int open_video(const char *path) {
     aring_write = 0;
     aring_count = 0;
 
+    /* Reset MP3 decoder state */
+    mp3_reset();
+    /* Reset detected MP3 format for new file */
+    mp3_detected_samplerate = 0;
+    mp3_detected_channels = 0;
+
     repeat_counter = 0;
     run_counter = 0;
     decode_counter = 0;
@@ -1914,8 +3160,12 @@ static int open_video(const char *path) {
     /* Pre-fill audio buffer only */
     refill_audio_ring();
 
-    /* Decode first frame */
-    decode_single_frame(0);
+    /* Don't decode first frame here for MPEG-4 - do lazy init in retro_run
+       so we can see debug output. For MJPEG, decode first frame normally. */
+    if (video_codec_type != CODEC_TYPE_MPEG4) {
+        decode_single_frame(0);
+    }
+    /* For MPEG-4, first frame will be decoded in first retro_run() call */
 
     is_playing = 1;
     return 1;
@@ -1932,21 +3182,22 @@ void retro_init(void) {
     init_color_tables();
     load_settings();  /* Load saved settings (color mode, show_time, etc.) */
 }
-void retro_deinit(void) { if (video_file) fclose(video_file); }
+void retro_deinit(void) { close_xvid(); if (video_file) fclose(video_file); }
 unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 void retro_set_controller_port_device(unsigned p, unsigned d) { (void)p; (void)d; }
 
 void retro_get_system_info(struct retro_system_info *info) {
     memset(info, 0, sizeof(*info));
     info->library_name = "A ZERO Player";
-    info->library_version = "0.72";
+    info->library_version = "0.96";
     info->need_fullpath = 1;
     info->valid_extensions = "avi";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info) {
     info->timing.fps = 30;
-    info->timing.sample_rate = AUDIO_SAMPLE_RATE;
+    /* Use actual sample rate from file, fallback to 44100 if not yet known */
+    info->timing.sample_rate = (audio_sample_rate > 0) ? audio_sample_rate : 44100;
     info->geometry.base_width = SCREEN_WIDTH;
     info->geometry.base_height = SCREEN_HEIGHT;
     info->geometry.max_width = SCREEN_WIDTH;
@@ -1969,6 +3220,7 @@ void retro_reset(void) {
     aring_read = 0;
     aring_write = 0;
     aring_count = 0;
+    mp3_reset();
     repeat_counter = 0;
 }
 
@@ -2197,7 +3449,13 @@ void retro_run(void) {
                             if (color_submenu_scroll > COLOR_MODE_COUNT - 8)
                                 color_submenu_scroll = COLOR_MODE_COUNT - 8;
                             break;
-                        case 3:  /* Resume - unpause and close menu */
+                        case 3:  /* Xvid Black - toggle TV/PC range */
+                            xvid_black_level = (xvid_black_level == XVID_BLACK_TV) ?
+                                               XVID_BLACK_PC : XVID_BLACK_TV;
+                            /* Force redraw current frame with new setting */
+                            decode_single_frame(current_frame_idx);
+                            break;
+                        case 4:  /* Resume - unpause and close menu */
                             is_paused = 0;
                             was_paused_before_menu = 0;
                             icon_type = ICON_PLAY;
@@ -2205,13 +3463,13 @@ void retro_run(void) {
                             menu_active = 0;
                             decode_single_frame(current_frame_idx);
                             break;
-                        case 4:  /* Show Time toggle */
+                        case 5:  /* Show Time toggle */
                             show_time = !show_time;
                             break;
-                        case 5:  /* Debug Info toggle */
+                        case 6:  /* Debug Info toggle */
                             show_debug = !show_debug;
                             break;
-                        case 6:  /* Restart */
+                        case 7:  /* Restart */
                             seek_to_frame(0);
                             is_paused = 0;
                             was_paused_before_menu = 0;
@@ -2219,14 +3477,14 @@ void retro_run(void) {
                             icon_timer = ICON_FRAMES;
                             menu_active = 0;
                             break;
-                        case 7:  /* Save Settings */
+                        case 8:  /* Save Settings */
                             save_settings();
                             save_feedback_timer = SAVE_FEEDBACK_FRAMES;
                             break;
-                        case 8:  /* Instructions */
+                        case 9:  /* Instructions */
                             submenu_active = 1;
                             break;
-                        case 9:  /* About */
+                        case 10:  /* About */
                             submenu_active = 2;
                             break;
                     }
@@ -2329,6 +3587,7 @@ void retro_run(void) {
             aring_read = 0;
             aring_write = 0;
             aring_count = 0;
+            mp3_reset();
             repeat_counter = 0;
             refill_audio_ring();
         }
@@ -2425,8 +3684,99 @@ void retro_run(void) {
 
             draw_str(80, 32, "Aud:", 0xFFFF);
             draw_num(106, 32, audio_sample_rate, 0xF81F);
+            /* Show audio format: PCM or ADPCM with block align */
+            if (audio_format == AUDIO_FMT_ADPCM) {
+                draw_str(150, 32, "ADPCM", 0x07FF);  /* Cyan */
+                draw_str(190, 32, "B:", 0xFFFF);
+                draw_num(206, 32, adpcm_block_align, 0x07FF);
+            } else if (audio_format == AUDIO_FMT_PCM) {
+                draw_str(150, 32, "PCM", 0x07E0);  /* Green */
+            } else if (audio_format == AUDIO_FMT_MP3) {
+                draw_str(150, 32, "MP3", 0xF81F);  /* Magenta */
+                /* MP3 debug: frames/errors/bytes */
+                draw_str(180, 32, "F:", 0xFFFF);
+                draw_num(196, 32, mp3_debug_frames, 0xF81F);
+                draw_str(240, 32, "E:", 0xFFFF);
+                draw_num(256, 32, mp3_debug_errors, mp3_debug_errors > 0 ? 0xF800 : 0x07E0);
+            }
         } else {
             draw_str(2, 32, "Audio: none", 0x7BEF);
+        }
+
+        /* Video codec info - moved to line 42 to make room for audio format */
+        draw_str(2, 42, "Codec:", 0xFFFF);
+        if (video_fourcc[0]) {
+            draw_str(44, 42, video_fourcc, video_codec_type == CODEC_TYPE_MPEG4 ? 0xF81F : 0x07E0);
+        } else {
+            draw_str(44, 42, "???", 0xF800);
+        }
+
+        /* MP3 debug - big display in center of screen */
+        if (audio_format == AUDIO_FMT_MP3) {
+            int dx = 30, dy = 40;
+            draw_fill_rect(dx, dy, dx + 260, dy + 160, 0x0000);
+            draw_rect(dx, dy, dx + 260, dy + 160, 0xF81F);
+            draw_str(dx + 90, dy + 3, "MP3 DEBUG", 0xF81F);
+            /* Row 1: Frames, Errors */
+            draw_str(dx + 5, dy + 14, "Frm:", 0xFFFF);
+            draw_num(dx + 35, dy + 14, mp3_debug_frames, 0x07E0);
+            draw_str(dx + 100, dy + 14, "Err:", 0xFFFF);
+            draw_num(dx + 130, dy + 14, mp3_debug_errors, mp3_debug_errors > 0 ? 0xF800 : 0x07E0);
+            draw_str(dx + 170, dy + 14, "Fill:", 0xFFFF);
+            draw_num(dx + 205, dy + 14, mp3_debug_fill, 0xFFE0);
+            /* Row 2: PCM info from libmad */
+            draw_str(dx + 5, dy + 26, "pcmLen:", 0xFFFF);
+            draw_num(dx + 55, dy + 26, mp3_debug_pcm_len, mp3_debug_pcm_len > 0 ? 0x07E0 : 0xF800);
+            draw_str(dx + 110, dy + 26, "pcmCh:", 0xFFFF);
+            draw_num(dx + 150, dy + 26, mp3_debug_pcm_ch, mp3_debug_pcm_ch > 0 ? 0x07E0 : 0xF800);
+            draw_str(dx + 180, dy + 26, "outS:", 0xFFFF);
+            draw_num(dx + 215, dy + 26, mp3_debug_out_smp, mp3_debug_out_smp > 0 ? 0x07E0 : 0xF800);
+            /* Row 3: Raw sample value */
+            draw_str(dx + 5, dy + 38, "rawHi:", 0xFFFF);
+            draw_num(dx + 50, dy + 38, mp3_debug_raw_hi, mp3_debug_raw_hi != 0 ? 0x07E0 : 0xF800);
+            draw_str(dx + 130, dy + 38, "decSmp:", 0xFFFF);
+            draw_num(dx + 180, dy + 38, mp3_debug_dec_smp, mp3_debug_dec_smp != 0 ? 0x07E0 : 0xF800);
+            /* Row 4: Ring buffer */
+            draw_str(dx + 5, dy + 50, "DecB:", 0xFFFF);
+            draw_num(dx + 45, dy + 50, mp3_debug_bytes, 0x07FF);
+            draw_str(dx + 130, dy + 50, "rngSmp:", 0xFFFF);
+            draw_num(dx + 180, dy + 50, mp3_debug_ring_smp, mp3_debug_ring_smp != 0 ? 0x07E0 : 0xF800);
+            /* Row 5: Output */
+            draw_str(dx + 5, dy + 62, "Sent:", 0xFFFF);
+            draw_num(dx + 45, dy + 62, mp3_debug_sent, mp3_debug_sent > 0 ? 0x07E0 : 0xF800);
+            draw_str(dx + 130, dy + 62, "outSmp:", 0xFFFF);
+            draw_num(dx + 180, dy + 62, mp3_debug_sample, mp3_debug_sample != 0 ? 0x07E0 : 0xF800);
+            /* Row 6: Ring buffer state */
+            draw_str(dx + 5, dy + 74, "Ring:", 0xFFFF);
+            draw_num(dx + 45, dy + 74, mp3_debug_ring, 0xFFE0);
+            /* Row 7: Audio params from AVI header */
+            draw_str(dx + 5, dy + 86, "SR:", 0xFFFF);
+            draw_num(dx + 30, dy + 86, audio_sample_rate, 0xF81F);
+            draw_str(dx + 90, dy + 86, "BPS:", 0xFFFF);
+            draw_num(dx + 120, dy + 86, audio_bytes_per_sample, 0xF81F);
+            draw_str(dx + 150, dy + 86, "Ch:", 0xFFFF);
+            draw_num(dx + 175, dy + 86, audio_channels, 0xF81F);
+            /* Row 7b: Detected MP3 format (from actual MP3 data) */
+            draw_str(dx + 200, dy + 86, "MP3:", 0xFFE0);
+            draw_num(dx + 230, dy + 86, mp3_detected_samplerate, mp3_detected_samplerate > 0 ? 0x07E0 : 0xF800);
+            draw_str(dx + 280, dy + 86, "/", 0xFFE0);
+            draw_num(dx + 290, dy + 86, mp3_detected_channels, mp3_detected_channels > 0 ? 0x07E0 : 0xF800);
+            /* Row 8: first decoded sample */
+            draw_str(dx + 5, dy + 100, "decSmp:", 0xFFFF);
+            draw_num(dx + 55, dy + 100, mp3_debug_dec_smp, mp3_debug_dec_smp != 0 ? 0x07E0 : 0xF800);
+            /* Row 9: Summary - which stage fails? */
+            draw_str(dx + 5, dy + 112, "STAGE:", 0xFFE0);
+            if (mp3_debug_pcm_len == 0) {
+                draw_str(dx + 55, dy + 112, "pcm.len=0!", 0xF800);
+            } else if (mp3_debug_dec_smp == 0) {
+                draw_str(dx + 55, dy + 112, "decode=0!", 0xF800);
+            } else if (mp3_debug_ring_smp == 0) {
+                draw_str(dx + 55, dy + 112, "ring=0!", 0xF800);
+            } else if (mp3_debug_sample == 0) {
+                draw_str(dx + 55, dy + 112, "out=0!", 0xF800);
+            } else {
+                draw_str(dx + 55, dy + 112, "ALL OK!", 0x07E0);
+            }
         }
     }
 
@@ -2497,7 +3847,12 @@ bool retro_load_game(const struct retro_game_info *info) {
     return true;
 }
 
-void retro_unload_game(void) { if (video_file) fclose(video_file); is_playing = 0; }
+void retro_unload_game(void) {
+    close_xvid();  /* Close Xvid decoder if open */
+    if (video_file) fclose(video_file);
+    video_file = NULL;
+    is_playing = 0;
+}
 unsigned retro_get_region(void) { return RETRO_REGION_NTSC; }
 bool retro_load_game_special(unsigned t, const struct retro_game_info *i, size_t n) { return false; }
 size_t retro_serialize_size(void) { return 0; }

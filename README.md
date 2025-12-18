@@ -1,10 +1,11 @@
-# A ZERO Player v0.75
+# A ZERO Player v1.20
 
-Motion JPEG video player for SF2000 (Data Frog) handheld console.
+Video player for SF2000 and GB300 handheld consoles.
 
 ## Features
 
-- **Motion JPEG (MJPEG) AVI playback** - software decoding
+- **MJPEG and Xvid video playback** - software decoding
+- **Audio support** - PCM WAV, ADPCM, MP3 (22kHz recommended)
 - **Built-in file browser** - load videos directly from SD card
 - **15 color modes** - Normal, Night, Warm, Sepia, Grayscale, Dither variations and more
 - **Seek controls** - Left/Right (15s), Up/Down (1min), slider in menu
@@ -14,6 +15,7 @@ Motion JPEG video player for SF2000 (Data Frog) handheld console.
 - **Key lock** - hold L+R shoulders for 2 seconds to lock/unlock controls
 - **Debug panel** - FPS, frame count, audio buffer status
 - **Polish character support** - filenames with Polish letters display correctly
+- **Fast loading** - uses AVI index for instant start on long videos
 
 ## Controls
 
@@ -40,10 +42,14 @@ Motion JPEG video player for SF2000 (Data Frog) handheld console.
 ## Supported Video Format
 
 - **Container**: AVI with idx1 index
-- **Video codec**: Motion JPEG (MJPEG)
+- **Video codec**: Motion JPEG (MJPEG) or Xvid (MPEG-4 ASP)
 - **Resolution**: Up to 320x240 (larger videos are scaled down)
-- **Frame rate**: Any (displayed at native rate with frame repeat if needed)
-- **Audio**: PCM audio supported (22050Hz mono recommended)
+- **Frame rate**: 15 fps recommended (30 fps may have slowdowns)
+- **Audio codecs**:
+  - PCM WAV (22kHz mono) - best quality, largest files
+  - ADPCM (22kHz mono) - good quality, smaller files
+  - MP3 (22kHz mono) - smaller files, higher CPU usage
+  - **Note**: 44kHz audio is currently disabled due to sync issues
 
 ### Recommended Settings
 
@@ -101,6 +107,17 @@ Then link with sf2000_multicore to create `core_87000000`.
 - **Memory**: Static allocation, no malloc at runtime
 
 ## Changelog
+
+### v1.20
+- Xvid (MPEG-4 ASP) video codec support
+- Fast loading for all codecs using AVI index
+- Fixed audio/video sync issues
+- MP3 seek fix for 22kHz audio
+
+### v1.18
+- MP3 audio codec support
+- ADPCM audio codec support
+- 44kHz audio temporarily disabled (sync issues)
 
 ### v0.75
 - Built-in file browser for loading videos from SD card

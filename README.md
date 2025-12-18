@@ -10,7 +10,7 @@ Video player for SF2000 and GB300 handheld consoles.
 - **15 color modes** - Normal, Night, Warm, Sepia, Grayscale, Dither variations and more
 - **Seek controls** - Left/Right (15s), Up/Down (1min), slider in menu
 - **Time display** with black outline for visibility
-- **Amiga-style menu** - press START to access
+- **Start configuration menu** - press START to access
 - **Save Settings** - remembers color mode, display options, last directory
 - **Key lock** - hold L+R shoulders for 2 seconds to lock/unlock controls
 - **Debug panel** - FPS, frame count, audio buffer status
@@ -141,3 +141,4 @@ Based on libretro API. TJpgDec by ChaN (http://elm-chan.org/).
 ## Author
 
 Grzegorz Korycki
+

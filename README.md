@@ -51,6 +51,16 @@ World's first video player for SF2000 and GB300 handheld consoles.
   - MP3 (22kHz mono) - smaller files, higher CPU usage
   - **Note**: 44kHz audio is currently disabled due to sync issues
 
+## How to use automatic batch converter?
+1. Download !CONVERT_no_ffmpeg_Windows.zip
+2. Extract it where you have enough space.
+3. Download ffmpeg.exe and copy it to that folder
+4. Put your source videos in input.
+5. Run "convert_custom.bat" and select your settings. Recommended: Xvid + MP3 audio.
+6. When it finishes copy the videos from output_avi_xvid to your memory card - either:
+   a) copy to /VIDEOS/ if you want to load them manually from the interface or
+   b) copy them to /ROMS/a0_player/ and run make-romlist.bat from the main directory of the card, if you want them visible in ROMS on the console.
+
 ### Recommended Settings
 
 - **Optimal format**: 320x240 @ 15 fps
@@ -141,5 +151,6 @@ Based on libretro API. TJpgDec by ChaN (http://elm-chan.org/).
 ## Author
 
 Grzegorz Korycki
+
 
 

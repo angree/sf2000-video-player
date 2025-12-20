@@ -64,7 +64,7 @@ World's first video player for SF2000 and GB300 handheld consoles.
 ### Recommended Settings
 
 - **Optimal format**: 320x240 @ 15 fps
-- At **30 fps** there may be occasional slowdowns during complex scenes - use ADPCM instead of MP3 to reduce the CPU load
+- At **30 fps** there may be slowdowns and sound stuttering - use ADPCM instead of MP3 to reduce the CPU load, but the most reliable choice is 15 FPS. If you really have to have 30 FPS i recommend MJPEG + ADPCM format. (fastest)
 - **Dither color modes** may cause slight additional slowdown
 - **Widescreen (16:9) content** with black bars on top/bottom requires less decoding, so 30 fps may work better for such videos
 - For best experience, **15 fps is recommended**
@@ -73,20 +73,8 @@ World's first video player for SF2000 and GB300 handheld consoles.
 
 #### Easy way (Windows, no FFmpeg required)
 
-Download `convert_no_ffmpeg_windows.7z` from releases. Just drop all your videos into the `input` folder and run the batch script - converted videos ready for SF2000 will appear in the `output` folder. Quick and easy conversion to 15 fps or 30 fps MJPEG format.
+Download `convert_no_ffmpeg_windows.7z` from releases. Download FFMPEG.EXE Just drop all your videos into the `input` folder and run the batch script - converted videos ready for SF2000 will appear in the `output` folder. 
 
-#### Using FFmpeg
-
-```bash
-# 15 fps (recommended)
-ffmpeg -i input.mp4 -vf "scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2,fps=15" -c:v mjpeg -q:v 5 output.avi
-
-# 30 fps (may have slowdowns)
-ffmpeg -i input.mp4 -vf "scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2,fps=30" -c:v mjpeg -q:v 5 output.avi
-
-# With audio (15 fps)
-ffmpeg -i input.mp4 -vf "scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2,fps=15" -c:v mjpeg -q:v 5 -c:a pcm_s16le -ar 22050 -ac 1 output.avi
-```
 
 ## Settings
 
@@ -108,13 +96,6 @@ make platform=sf2000
 ```
 
 Then link with sf2000_multicore to create `core_87000000`.
-
-## Technical Details
-
-- **Display**: RGB565, 320x240
-- **JPEG decoder**: TJpgDec (Tiny JPEG Decompressor)
-- **Architecture**: MIPS32 soft-float (no FPU)
-- **Memory**: Static allocation, no malloc at runtime
 
 ## Changelog
 
@@ -151,6 +132,7 @@ Based on libretro API. TJpgDec by ChaN (http://elm-chan.org/).
 ## Author
 
 Grzegorz Korycki
+
 
 
 

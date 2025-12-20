@@ -11,7 +11,7 @@
  */
 
 /* ========== VERSION - CHANGE HERE ========== */
-#define PLAYER_VERSION "1.20"
+#define PLAYER_VERSION "1.21"
 /* ============================================ */
 
 #include "libretro.h"
@@ -937,9 +937,10 @@ static void draw_icon(int type) {
     }
 }
 
-/* Forward declaration for seek preview */
+/* Forward declarations */
 static int decode_single_frame(int idx);
 static int load_avi_file(const char *path);
+static void update_av_info(void);
 
 /* ========== Settings save/load ========== */
 static void save_settings(void) {
@@ -3168,6 +3169,11 @@ static int open_video(const char *path) {
     /* For MPEG-4, first frame will be decoded in first retro_run() call */
 
     is_playing = 1;
+
+    /* Update AV info to reflect new file's sample rate
+       (critical when loading from menu - sample rate may differ from initial) */
+    update_av_info();
+
     return 1;
 }
 
@@ -3196,13 +3202,21 @@ void retro_get_system_info(struct retro_system_info *info) {
 
 void retro_get_system_av_info(struct retro_system_av_info *info) {
     info->timing.fps = 30;
-    /* Use actual sample rate from file, fallback to 44100 if not yet known */
-    info->timing.sample_rate = (audio_sample_rate > 0) ? audio_sample_rate : 44100;
+    /* Use actual sample rate from file, fallback to 22050 (we don't support 44kHz yet) */
+    info->timing.sample_rate = (audio_sample_rate > 0) ? audio_sample_rate : 22050;
     info->geometry.base_width = SCREEN_WIDTH;
     info->geometry.base_height = SCREEN_HEIGHT;
     info->geometry.max_width = SCREEN_WIDTH;
     info->geometry.max_height = SCREEN_HEIGHT;
     info->geometry.aspect_ratio = 4.0f / 3.0f;
+}
+
+/* Update AV info after loading a new file (needed when loading from menu) */
+static void update_av_info(void) {
+    if (!environ_cb) return;
+    struct retro_system_av_info av_info;
+    retro_get_system_av_info(&av_info);
+    environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
 }
 
 void retro_set_environment(retro_environment_t cb) { environ_cb = cb; }

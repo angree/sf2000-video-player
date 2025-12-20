@@ -66,7 +66,7 @@ World's first video player for SF2000 and GB300 handheld consoles.
 - **Optimal format**: 320x240 @ 15 fps
 - At **30 fps** there may be slowdowns and sound stuttering - use ADPCM instead of MP3 to reduce the CPU load, but the most reliable choice is 15 FPS. If you really have to have 30 FPS i recommend MJPEG + ADPCM format. (fastest)
 - **Dither color modes** may cause slight additional slowdown
-- **Widescreen (16:9) content** with black bars on top/bottom requires less decoding, so 30 fps may work better for such videos
+- **Widescreen (16:9) content** with black bars on top/bottom requires less decoding, so 30 fps may work better for such videos, but it may still not work at 100%, unless you are using MJPEG format and WAV/ADPCM for audio.
 - For best experience, **15 fps is recommended**
 
 ### Converting Videos
@@ -132,6 +132,7 @@ Based on libretro API. TJpgDec by ChaN (http://elm-chan.org/).
 ## Author
 
 Grzegorz Korycki
+
 
 
 

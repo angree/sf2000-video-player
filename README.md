@@ -6,7 +6,7 @@ World's first video player for SF2000 and GB300 handheld consoles.
 
 - **MJPEG and Xvid video playback** - software decoding
 - **Audio support** - PCM WAV, ADPCM, MP3 (22kHz recommended)
-- **Built-in file browser** - load videos directly from SD card
+- **Built-in file browser** - load videos directly from SD card; browser now supports long filenames and special characters
 - **15 color modes** - Normal, Night, Warm, Sepia, Grayscale, Dither variations and more
 - **Seek controls** - Left/Right (15s), Up/Down (1min), slider in menu
 - **Time display** with black outline for visibility
@@ -14,7 +14,7 @@ World's first video player for SF2000 and GB300 handheld consoles.
 - **Save Settings** - remembers color mode, display options, last directory
 - **Key lock** - hold L+R shoulders for 2 seconds to lock/unlock controls
 - **Debug panel** - FPS, frame count, audio buffer status
-- **Polish character support** - filenames with Polish letters display correctly
+- **Polish character support** - filenames with Polish letters are stripped to display latin letters instead
 - **Fast loading** - uses AVI index for instant start on long videos
 
 ## Controls
@@ -140,6 +140,7 @@ Based on libretro API. TJpgDec by ChaN (http://elm-chan.org/).
 ## Author
 
 Grzegorz Korycki
+
 
 
 
